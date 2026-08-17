@@ -1,0 +1,31 @@
+# 虚拟环境
+venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 数据集（本地采集/生成的训练与裁剪图片，不进入仓库）
+**/data/EDM/
+Cropped50x/
+Cropped100x/
+Cropped200x/
+
+# 大模型权重（重新训练生成，见 README）
+**/models/*.pth
+
+# 运行时产物
+cache/
+temp/
+**/experiments/log.txt
+
+# 个人工作文档（仅保留在本地）
+会话交接.md
+下一步行动计划.md
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

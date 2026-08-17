@@ -1,0 +1,13 @@
+opencv-python
+scikit-image
+scikit-learn
+scipy
+numpy
+pandas
+matplotlib
+joblib
+torch
+torchvision
+fastapi
+uvicorn
+python-multipart
