@@ -1,39 +1,44 @@
-"""摄像头采图 + 推理 Demo。
+"""相机取景 + 手动采图（带预览窗口）。
 
 用法（在项目根目录 vision-roughness/ 下运行）：
     python src/capture_demo.py
 
 操作：
-    空格键：保存当前帧并调用 ResNet18 推理
+    空格键：保存当前帧到 data/captures/
     q 键：退出
 
-注意：
-    本脚本使用电脑摄像头临时验证链路，预测结果仅用于演示，
-    不代表生产环境下的粗糙度分类精度。
+用途：架相机时看实时画面、对焦、确认零件在视野中心；空格随手存图。
+日常测量请直接用 测量.bat（相机现拍 → 结果窗口）。
 """
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
 import cv2
 
 sys.path.insert(0, "src")
-from camera_adapter import WebcamCamera
-from infer import predict
+import config
+from camera_adapter import create_camera
 
 SAVE_DIR = Path("data/captures")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def main(device_id: int = 0, model_name: str = "resnet"):
-    print("启动摄像头 Demo...")
-    print("按 [空格] 拍照并推理，按 [q] 退出")
+def main(device_id: int = None):
+    print("启动相机取景...")
+    print("按 [空格] 保存当前帧，按 [q] 退出")
 
-    with WebcamCamera(device_id=device_id) as cam:
+    cam_kwargs = dict(config.CAMERA_KWARGS)
+    if device_id is not None:
+        cam_kwargs["device_id"] = device_id   # webcam 模式下可覆盖 config 中的编号
+
+    with create_camera(config.CAMERA_TYPE, **cam_kwargs) as cam:
+        win = "Camera - SPACE: save, Q: quit"
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, 1280, 960)   # 12MP 原图太大，窗口缩放到 1280x960
         while True:
             frame = cam.capture()
-            cv2.imshow("Camera Demo - SPACE: capture, Q: quit", frame)
+            cv2.imshow(win, frame)
 
             key = cv2.waitKey(30) & 0xFF
             if key == ord("q"):
@@ -42,24 +47,18 @@ def main(device_id: int = 0, model_name: str = "resnet"):
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 save_path = SAVE_DIR / f"capture_{timestamp}.jpg"
                 cv2.imwrite(str(save_path), frame)
-                print(f"\n已保存: {save_path}")
-
-                try:
-                    cls, conf = predict(str(save_path), model_name=model_name)
-                    print(f"预测结果: {cls}  置信度: {conf:.2%}")
-                except Exception as e:
-                    print(f"推理失败: {e}")
+                print(f"已保存: {save_path}")
 
     cv2.destroyAllWindows()
-    print("Demo 结束")
+    print("结束")
 
 
 if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", type=int, default=0, help="摄像头编号，默认 0")
-    ap.add_argument("--model", default="resnet", choices=["glcm", "resnet"], help="推理模型")
+    ap.add_argument("--device", type=int, default=None,
+                    help="摄像头编号（仅 webcam 模式有效，默认读 config.py）")
     args = ap.parse_args()
 
-    main(device_id=args.device, model_name=args.model)
+    main(device_id=args.device)

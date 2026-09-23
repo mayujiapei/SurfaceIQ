@@ -1,13 +1,3 @@
+# 圆环尺寸测量所需依赖（tkinter 为 Python 标准库，无需安装）
 opencv-python
-scikit-image
-scikit-learn
-scipy
 numpy
-pandas
-matplotlib
-joblib
-torch
-torchvision
-fastapi
-uvicorn
-python-multipart

@@ -6,8 +6,7 @@ __pycache__/
 *.pyc
 *.pyo
 
-# 数据集（本地采集/生成的训练与裁剪图片，不进入仓库）
-**/data/EDM/
+# 数据集（EDM 表面图像，本地保留、不进入仓库；以后重训粗糙度用）
 Cropped50x/
 Cropped100x/
 Cropped200x/
@@ -15,17 +14,19 @@ Cropped200x/
 # 大模型权重（重新训练生成，见 README）
 **/models/*.pth
 
-# 运行时产物
-cache/
-temp/
-**/experiments/log.txt
-
-# 个人工作文档（仅保留在本地）
-会话交接.md
-下一步行动计划.md
+# 运行时产物（每次测量/调试自动生成，不进入仓库）
+debug/
+vision-roughness/data/captures/*
+!vision-roughness/data/captures/capture_single_20260730_203312.jpg
+# temp/ 下只保留排查脚本 hik_debug.py，其余忽略
+**/temp/*
+!**/temp/hik_debug.py
 
 # 编辑器 / 系统
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# AI 会话工具目录（本地计划与辅助脚本）
+.zcode/
