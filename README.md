@@ -103,8 +103,6 @@ SurfaceIQ/
 │   ├── data/captures/           采集的图片
 │   ├── temp/hik_debug.py        海康取图故障排查脚本
 │   └── requirements.txt
-├── Cropped50x/ Cropped100x/ Cropped200x/
-│                                EDM 表面图像数据集（12000 张，当前未使用）
 └── data/captures/               标定/验证用标准照片
 ```
 
@@ -140,17 +138,6 @@ SurfaceIQ/
 
 3. 换算系数跟着「相机 + 镜头 + 拍摄距离」走，三者任一变化都必须重建。
    拿到图纸标称值后，可用 `--spec-od / --spec-id / --spec-bolt / --tol` 开 OK/NG 判定。
-
----
-
-## 粗糙度分类（待重建）
-
-`Cropped50x/`、`Cropped100x/`、`Cropped200x/` 是 Kaggle *Surface Roughness
-Classification* 数据集（EDM 表面显微图，共 12000 张，按加工角度 `00`~`45` 分
-16 个目录，每 3° 一类）。
-
-**当前代码未使用这批数据**，留作以后重训粗糙度模型的数据源。
-（此前的 ResNet18 / GLCM+SVM 分类代码与模型已移除。）
 
 ---
 

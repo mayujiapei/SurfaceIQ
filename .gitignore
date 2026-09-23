@@ -6,11 +6,6 @@ __pycache__/
 *.pyc
 *.pyo
 
-# 数据集（EDM 表面图像，本地保留、不进入仓库；以后重训粗糙度用）
-Cropped50x/
-Cropped100x/
-Cropped200x/
-
 # 大模型权重（重新训练生成，见 README）
 **/models/*.pth
 
