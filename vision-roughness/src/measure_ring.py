@@ -160,6 +160,26 @@ def resolve_ratio(args, outer_dia_px, profile=None) -> tuple:
     )
 
 
+def locate_fail_hint(img: np.ndarray) -> str:
+    """外圈定位失败时，尽量说清到底是"太暗/过曝"还是别的原因。
+
+    以前一律报「外圈拟合失败。检查：对焦、光照、零件是否在画面中心」——实测现场
+    多次失败其实是**光不足**（标定图均值 110、亮像素 5.2%；那批失败图只有 15~31、
+    亮像素 0.0%），操作员光看这句话不知道该去补光。
+
+    门槛留了很大余量：均值 60、亮像素 0.5% / 30%。
+    """
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mean, bright = float(g.mean()), float((g > 200).mean())
+    if mean < 60 or bright < 0.005:
+        return (f"外圈拟合失败：画面太暗（灰度均值 {mean:.0f}/255，亮像素 {bright * 100:.1f}%）。\n"
+                "先补光或把曝光调高再重拍。参考：能稳定测出的标定图均值 110、亮像素 5%。")
+    if bright > 0.30:
+        return (f"外圈拟合失败：画面过曝（亮像素 {bright * 100:.1f}%）。\n"
+                "把曝光调低或减少直射反光再重拍。参考：能稳定测出的标定图亮像素 5%。")
+    return "外圈拟合失败。检查：对焦、光照、零件是否在画面中心"
+
+
 def measure(img: np.ndarray, args) -> RingResult:
     """检测 → 换算 → 判定 → 落盘（调试图 + 文字报告），返回结构化结果。
 
@@ -168,7 +188,7 @@ def measure(img: np.ndarray, args) -> RingResult:
     profile = load_profile(getattr(args, "profile", None))
     res = detect(img, profile=profile)
     if res["outer"] is None:
-        raise MeasureError("外圈拟合失败。检查：对焦、光照、零件是否在画面中心")
+        raise MeasureError(locate_fail_hint(img))
 
     lines: list = []
     warnings: list = []
@@ -267,6 +287,12 @@ def measure(img: np.ndarray, args) -> RingResult:
                "位置按型号档案的相对角度定位")
         else:
             _p("提示: 螺栓孔按沉孔口(norm<0.72 阈值交叉)定义；已用游程宽度过滤+渐缩残差处理暗带/槽缘粘连")
+    elif res.get("bolts_skipped"):
+        # 中心孔没检出 → 螺栓孔那段**整段没被尝试**。以前这里也报「未检测到螺栓孔」，
+        # 操作员会去查孔，其实该查中心孔。
+        _p("螺栓孔: 未尝试——中心孔没检出，而螺栓孔的暗斑环带要靠中心孔挖出来。")
+        _p("        先解决中心孔（孔内反光/遮挡？），螺栓孔才会开始测。")
+        warnings.append("中心孔没检出，螺栓孔整段没有尝试；先解决中心孔")
     else:
         _p("未检测到螺栓孔")
         warnings.append("没检测到螺栓孔")

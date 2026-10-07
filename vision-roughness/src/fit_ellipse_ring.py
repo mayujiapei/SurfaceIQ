@@ -20,6 +20,7 @@ OUTER_COVER_MIN = 0.6        # 保留点数 ≥ 射线数×此比例（误锁只
 OUTER_AXIS_RATIO_MAX = 1.8   # 外圈长短轴比上限（斜视视角的物理上限）
 OUTER_MAX_CANDIDATES = 60    # 候选上限，防自适应搜索跑飞
 OUTER_CENTER_MIN_RATIO = 0.5  # 圆心最强径向峰 < 全局最强峰×此比例就丢弃（零件不在这儿）
+INNER_CENTER_MAX_SHIFT = 0.15  # 中心孔中心相对外圈中心的容许偏移（×外圈半径）
 
 
 # ---------------- 射线亚像素边缘 ----------------
@@ -507,6 +508,45 @@ def _outer_ok(ell, n, w, h):
     return (cx - s >= 0) and (cx + s <= w) and (cy - s >= 0) and (cy + s <= h)
 
 
+def _inner_candidates(r_outer):
+    """中心孔候选 (lo, hi, r0, polarity)，**旧档位排第一保基线**。
+
+    老代码写死"中心孔半径 = 外圈的 0.60~0.78 倍"——换个孔径比不同的型号就测不到
+    （而中心孔一挂，`if hole is not None` 还会连带把整段螺栓孔也跳过）。
+    现在按不同比例带各试一轮，由 `_inner_ok` 判可信。两种极性也一起试：孔内是暗是亮
+    取决于能不能看穿到台面/背景，不该写死。
+
+    r0 单独给、不取波段中点：老代码那一档用的是 0.70（而不是 0.60~0.78 的中点 0.69），
+    圆等价滤点边界跟着 r0 走，差这一点读数就会变——基线回归门就是靠这个抓出来的。
+    """
+    yield r_outer * 0.60, r_outer * 0.78, r_outer * 0.70, +1
+    for f_lo, f_hi in [(0.20, 0.36), (0.33, 0.50), (0.46, 0.64), (0.74, 0.92)]:
+        for pol in (+1, -1):
+            yield r_outer * f_lo, r_outer * f_hi, r_outer * (f_lo + f_hi) / 2, pol
+    yield r_outer * 0.60, r_outer * 0.78, r_outer * 0.70, -1
+
+
+def _inner_ok(ell, n, outer_ell):
+    """中心孔候选是否可信：点数够 + 轴比合理 + 确实落在外圈内 + 与外圈同心。
+
+    不做"不出画幅"检查——中心孔本来就在画面中间，那个判据没有区分力。
+    同心这条是有效的物理约束：中心孔与外圈是同一个零件上的同轴特征，
+    实测标定图两者中心只差 23.9px（外圈半径 1356px 的 1.8%）。
+    """
+    if n < OUTER_COVER_MIN * N_RAY:
+        return False
+    (icx, icy), (ia1, ia2), _ = ell
+    if min(ia1, ia2) <= 0 or max(ia1, ia2) / min(ia1, ia2) > OUTER_AXIS_RATIO_MAX:
+        return False
+    (ocx, ocy), (oa1, oa2), _ = outer_ell
+    r_outer = (oa1 + oa2) / 4
+    if (ia1 + ia2) / 4 >= r_outer * 0.95:                       # 必须确实在外圈之内
+        return False
+    if np.hypot(icx - ocx, icy - ocy) > r_outer * INNER_CENTER_MAX_SHIFT:
+        return False
+    return True
+
+
 # ---------------- 型号档案驱动的螺栓孔（装好紧固件的暗芯圆孔） ----------------
 
 def core_cross_points(gray, x, y, r_lo, r_hi, n_ray=48, frac=0.5):
@@ -641,21 +681,29 @@ def detect(img, init_c=None, init_r=None, profile=None):
             outer, n_o = ell, n
             break
     if outer is None:
-        return {"outer": None, "center_hole": None, "bolts": []}
+        return {"outer": None, "center_hole": None, "bolts": [], "bolts_skipped": True}
     (ocx, ocy), (oa1, oa2), oang = outer
 
     # ---- 中心孔: 外圈内暗->亮的上升沿 ----
+    # ---- 中心孔: 自适应波段（旧档位排第一保基线）----
     r_outer = (oa1 + oa2) / 4
-    pts_h = find_edge_points(sm, ocx, ocy, r_outer * 0.6, r_outer * 0.78, +1, 1.2, n_ray=72)
-    hole, n_h = filter_and_fit(pts_h, ocx, ocy, r_outer * 0.7)
+    hole = n_h = None
+    for (lo, hi, r0, pol) in _inner_candidates(r_outer):
+        pts_h = find_edge_points(sm, ocx, ocy, lo, hi, pol, 1.2, n_ray=N_RAY)
+        ell, n = filter_and_fit(pts_h, ocx, ocy, r0)
+        if ell is None:
+            continue
+        if _inner_ok(ell, n, outer):
+            hole, n_h = ell, n
+            break
     if hole is None:
-        hole = None
         hcx, hcy, ha1, ha2, hang = ocx, ocy, 0.0, 0.0, 0.0
     else:
         (hcx, hcy), (ha1, ha2), hang = hole
 
     # ---- 螺栓孔 ----
     bolts = []
+    bolts_skipped = False       # 区分"整段没被尝试"与"试了没找到"
     prof = profile or {}
     mmpx = prof.get("mm_per_px")
     if (prof.get("feature") == "core_hole" and prof.get("bolt_angles_rel")
@@ -716,7 +764,13 @@ def detect(img, init_c=None, init_r=None, profile=None):
                     bolts.append({"cx": ex, "cy": ey, "dia": (ea1 + ea2) / 2,
                                   "a1": ea1, "a2": ea2, "ang": eang, "n": n,
                                   "status": "OK"})
-    return {"outer": (outer, n_o), "center_hole": (hole, n_h), "bolts": bolts}
+    else:
+        # 中心孔没检出 → 这段螺栓孔定位（模板/共圆校验都以外圈椭圆为参照、但暗斑环带
+        # 要拿中心孔挖出来）整段**没有被尝试**。以前一律报「未检测到螺栓孔」，
+        # 操作员会去查孔，其实该查中心孔——所以这里把"没尝试"和"试了没找到"分开。
+        bolts_skipped = True
+    return {"outer": (outer, n_o), "center_hole": (hole, n_h), "bolts": bolts,
+            "bolts_skipped": bolts_skipped}
 
 
 def main(p: Path):

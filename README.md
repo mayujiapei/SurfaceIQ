@@ -246,6 +246,7 @@ SurfaceIQ/
 | 「能看见但取不到图」 | 占用 / 网线松动 / IP 冲突 | 关 MVS；查是否有两台设备同 IP |
 | 取图超时 `0x80000007` | 同上 | 跑 `venv\Scripts\python.exe temp\hik_debug.py` 逐环节定位 |
 | 「外圈拟合失败」且画面发黑 | 现场光不足 / 曝光太低 | 确认没被 MVS 占用后重开程序（会重新自动标定曝光）；仍失败就补光 |
+| 「螺栓孔: 未尝试」 | 中心孔没检出，螺栓孔那段整段没跑 | 先解决中心孔（孔内反光/遮挡？），螺栓孔才会开始测 |
 | 「没找到海康 SDK」 | MVS 未装完整或路径不符 | 重装 MVS（勾选 Python SDK），或改 `config.py` 的 `sdk_path` |
 | `No module named cv2` | 用了系统 Python | 改用 `venv\Scripts\python.exe` |
 | 窗口里数字都是「—」 | 检测失败 | 看窗口红底提示；检查对焦、光照、零件是否在画面中心 |
