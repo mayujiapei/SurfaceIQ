@@ -99,7 +99,7 @@ mm 读数 = 像素 × `models/mm_per_pixel.json` 的系数，改这个 json 会�
 ## 5. 领域陷阱（按这些结论行事，别自己推）
 
 - **螺栓孔测的是沉孔口口径**（含沉孔锥度；`measure_ring.py:222`、
-  `fit_ellipse_ring.py:293 rim_cross_points` 的 norm<0.72 阈值交叉），**不是螺纹孔径**。
+  `fit_ellipse_ring.py:259 rim_cross_points` 的 norm<0.72 阈值交叉），**不是螺纹孔径**。
   6 孔读数分散 154.5~176.3px ≈ ±7%（含斜视透视 + 沉孔口定义差异），**不得据此判定尺寸超差**。
 - **不传 `--spec-*` 时 `overall_judged=False`**，GUI 显示「已测量」（`gui_ring.py:550-553`），
   但 CLI 仍会打印「综合判定: OK」（`measure_ring.py:227`）。**这个 OK 不是合格判定**，只是
@@ -117,8 +117,13 @@ mm 读数 = 像素 × `models/mm_per_pixel.json` 的系数，改这个 json 会�
   换相机的唯一改动点，业务代码不许动。
 - **相机接入抽象层**：`src/camera_adapter.py`（`webcam` / `file` / `hikvision` 三实现，
   `create_camera()` 在 `:327`），海康 DLL 搜索路径由它自动补。
-- **检测管线核心**：`src/fit_ellipse_ring.py` 的 `detect()`（`:408`，返回
+- **检测管线核心**：`src/fit_ellipse_ring.py` 的 `detect()`（`:365`，返回
   `{"outer","center_hole","bolts"}`）。几何算法都改这里。
+- **`find_edge_points`（`:28`）的梯度算在未平滑的原始径向剖面上**。历史代码里有一行
+  `cv2.GaussianBlur(gi.reshape(1, -1), (1, 7), 0)`，但 `cv::Size` 是(宽,高)：宽 1 的核 +
+  单行图是**恒等操作**（实测最大差 0.0），已于 2026-10-07 删除，读数不变。**要加平滑就是
+  改所有读数**——堆 `(n_ray, L)` 配 `(1,7)` 是沿剖面平滑、配 `(7,1)` 是跨射线平滑，两者
+  都会动外径/孔径，属于测量定义变更，不要顺手混进清理提交。
 - **结果唯一来源**：`src/measure_ring.py` 的 `measure()`（`:125`）产出 `RingResult`（`:49`）。
   CLI 打印它，GUI 显示它（`gui_ring.py:245` 直接调 `measure()`）——**不要在 `gui_ring.py` 里
   自己再算一遍尺寸**。

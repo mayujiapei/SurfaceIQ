@@ -40,8 +40,7 @@ def find_edge_points(gray, cx, cy, r_lo, r_hi, polarity=-1, min_grad=1.2, n_ray=
         di, gi = d[m], g[m]
         if len(gi) < 8:
             continue
-        gs = cv2.GaussianBlur(gi.reshape(1, -1), (1, 7), 0).ravel()
-        grads = np.gradient(gs)
+        grads = np.gradient(gi)
         if mode == "outer_first":
             j = None
             for jj in range(len(grads) - 3, 3, -1):
@@ -108,39 +107,6 @@ def from_norm(nx, ny, ocx, ocy, oa1, oa2, oang):
 
 
 # ---------------- 螺栓孔: 模板匹配 + 等角共圆校验 ----------------
-
-def kasa_robust(pts, outlier=0.09, iters=3, min_pts=25):
-    """无中心先验的代数圆拟合(Käsa) + 残差滤除迭代。返回 (cx, cy, r, 保留点集)。"""
-    pts = np.asarray(pts, float)
-    for _ in range(iters):
-        if len(pts) < min_pts:
-            return None
-        A = np.c_[pts[:, 0], pts[:, 1], np.ones(len(pts))]
-        b = (pts ** 2).sum(1)
-        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-        cx, cy = sol[0] / 2, sol[1] / 2
-        r = float(np.sqrt(sol[2] + cx * cx + cy * cy))
-        d = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
-        keep = np.abs(d - r) <= r * outlier
-        if keep.all():
-            return cx, cy, r, pts
-        pts = pts[keep]
-    return cx, cy, r, pts
-
-
-def hole_dark_points(sm, x, y, norm, cap=130):
-    """以(x,y)为中心取局部暗点集: norm<0.72 且在 cap 圆内。"""
-    x, y = int(x), int(y)
-    h, w = sm.shape
-    x0, y0 = max(0, x - cap), max(0, y - cap)
-    x1, y1 = min(w, x + cap), min(h, y + cap)
-    m = (norm[y0:y1, x0:x1] < 0.72).astype(np.uint8) * 255
-    circ = cv2.circle(np.zeros_like(m), (x - x0, y - y0), cap, 255, -1)
-    pts = np.argwhere(cv2.bitwise_and(m, m, mask=circ) > 0)[:, ::-1].astype(float)
-    if len(pts):
-        pts[:, 0] += x0
-        pts[:, 1] += y0
-    return pts
 
 def rough_templates(sm, band, min_area=3000):
     """环带内粗找暗连通域，按圆度x面积选最像孔的区域做模板。"""
@@ -333,17 +299,8 @@ def polar_resid(ell, pts):
     th = np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx)
     xr = np.cos(th) * ca + np.sin(th) * sa
     yr = -np.cos(th) * sa + np.sin(th) * ca
-    rt = np.empty(len(pts))
-    for q in range(len(pts)):
-        lo, hi = 0.0, max(a1, a2) * 2
-        for _ in range(36):
-            mid = (lo + hi) / 2
-            v = ((mid * xr[q]) / (a1 / 2)) ** 2 + ((mid * yr[q]) / (a2 / 2)) ** 2
-            if v > 1:
-                hi = mid
-            else:
-                lo = mid
-        rt[q] = lo
+    # 解 ((rt*xr)/(a1/2))² + ((rt*yr)/(a2/2))² = 1 的闭式解
+    rt = 1.0 / np.sqrt((xr / (a1 / 2)) ** 2 + (yr / (a2 / 2)) ** 2)
     return np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - rt
 
 
