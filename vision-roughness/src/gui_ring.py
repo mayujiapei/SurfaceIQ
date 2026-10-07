@@ -324,8 +324,10 @@ class MeasureWindow:
         brief = friendly_error(exc)
         hint = "" if self.args.image else "处理完点「再测一次」即可。"
         self._show_message(f"{brief}\n{hint}".strip(), "error")
-        write_log(f"[{_now()}] {self.args.image or '相机现拍'}\n"
-                  f"{traceback.format_exc()}\n" + "-" * 60)
+        # 这里已经不在 except 块里（异常是后台线程捕获后经队列传过来的），
+        # traceback.format_exc() 只会返回 "NoneType: None" —— 必须用异常对象本身取堆栈。
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        write_log(f"[{_now()}] {self.args.image or '相机现拍'}\n{tb}" + "-" * 60)
         self.lbl_foot.config(text=f"详细日志: {LOG_PATH}")
 
     def _set_thumb(self, img):
@@ -366,7 +368,47 @@ def _open_file(path):
         messagebox.showwarning("打不开文件", f"{path}\n{e}")
 
 
+def _directory_arg(argv):
+    """返回 argv 里第一个「目录」参数；没有则 None。
+
+    拖拽文件夹到 测量.bat 时，bat 的 `%~x1` 判空分支会把文件夹当普通参数透传，
+    而本程序的 argparse 只认 -- 开头的选项，于是抛错退出；又因为走 pythonw
+    （无控制台）且 stdout/stderr 已被重定向进日志，用户看到的就是"完全没反应"。
+    所以在这里先拦下来，给一句中文提示。
+    """
+    for a in argv:
+        if a.startswith("-"):
+            continue
+        try:
+            if Path(a).is_dir():
+                return a
+        except OSError:
+            continue
+    return None
+
+
+def _warn_directory(arg: str):
+    """弹窗提示「要的是照片文件，不是文件夹」，并写日志。"""
+    msg = (f"这是文件夹，不是照片文件：\n{arg}\n\n"
+           "• 要测已有照片：把 .jpg 照片文件拖到 测量.bat 图标上\n"
+           "• 要用相机现拍：直接双击 测量.bat（不要带任何文件）")
+    write_log(f"[{_now()}] 参数是文件夹，已拒绝\n  {arg}\n" + "-" * 60)
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning("只能拖照片文件", msg)
+        root.destroy()
+    except Exception:                    # 连弹窗都失败就只剩日志了
+        pass
+
+
 def main():
+    # 先拦「文件夹参数」：argparse 对它的报错在 pythonw 下看不见
+    folder = _directory_arg(sys.argv[1:])
+    if folder is not None:
+        _warn_directory(folder)
+        return
+
     args = build_parser().parse_args()
     if args.image:                       # 先转绝对路径，再切 cwd
         args.image = str(Path(args.image).expanduser().resolve())
