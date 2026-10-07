@@ -6,6 +6,7 @@
 输出：
     保存图片到 data/captures/capture_single_<时间戳>.jpg
 
+相机型号与曝光全部由 src/config.py 决定（当前为海康工业相机），没有命令行参数。
 用途：需要一次拍很多张时（例如重复装夹拍 10 张评估尺寸重复性），
       文件名带时间戳、不会互相覆盖。
 """
@@ -23,13 +24,9 @@ SAVE_DIR = Path("data/captures")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def main(device_id: int = None):
-    cam_kwargs = dict(config.CAMERA_KWARGS)
-    if device_id is not None:
-        cam_kwargs["device_id"] = device_id   # webcam 模式下可覆盖 config 中的编号
-
+def main():
     print(f"打开相机（{config.CAMERA_TYPE}）...")
-    with create_camera(config.CAMERA_TYPE, **cam_kwargs) as cam:
+    with create_camera(config.CAMERA_TYPE, **config.CAMERA_KWARGS) as cam:
         print("采图中...")
         frame = cam.capture()
 
@@ -43,9 +40,8 @@ def main(device_id: int = None):
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--device", type=int, default=None,
-                    help="摄像头编号（仅 webcam 模式有效，默认读 config.py）")
-    args = ap.parse_args()
-
-    main(device_id=args.device)
+    # 无参数：相机与曝光统一由 src/config.py 决定（换相机只改那一处）。
+    # 见 capture_demo.py 的说明：保留空 parser 是为了 -h 与拒绝过时参数。
+    argparse.ArgumentParser(
+        description="单张采图（相机由 src/config.py 决定）").parse_args()
+    main()

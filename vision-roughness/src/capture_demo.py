@@ -7,6 +7,7 @@
     空格键：保存当前帧到 data/captures/
     q 键：退出
 
+相机型号与曝光全部由 src/config.py 决定（当前为海康工业相机），没有命令行参数。
 用途：架相机时看实时画面、对焦、确认零件在视野中心；空格随手存图。
 日常测量请直接用 测量.bat（相机现拍 → 结果窗口）。
 """
@@ -24,15 +25,11 @@ SAVE_DIR = Path("data/captures")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def main(device_id: int = None):
+def main():
     print("启动相机取景...")
     print("按 [空格] 保存当前帧，按 [q] 退出")
 
-    cam_kwargs = dict(config.CAMERA_KWARGS)
-    if device_id is not None:
-        cam_kwargs["device_id"] = device_id   # webcam 模式下可覆盖 config 中的编号
-
-    with create_camera(config.CAMERA_TYPE, **cam_kwargs) as cam:
+    with create_camera(config.CAMERA_TYPE, **config.CAMERA_KWARGS) as cam:
         win = "Camera - SPACE: save, Q: quit"
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win, 1280, 960)   # 12MP 原图太大，窗口缩放到 1280x960
@@ -56,9 +53,9 @@ def main(device_id: int = None):
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--device", type=int, default=None,
-                    help="摄像头编号（仅 webcam 模式有效，默认读 config.py）")
-    args = ap.parse_args()
-
-    main(device_id=args.device)
+    # 无参数：相机与曝光统一由 src/config.py 决定（换相机只改那一处）。
+    # 之所以保留这个空 parser —— 一是让 -h 能出说明，二是让过时的参数
+    # （如以前那个只对笔记本摄像头有效的 --device）报错，而不是被静默忽略。
+    argparse.ArgumentParser(
+        description="相机取景 + 手动采图（相机由 src/config.py 决定）").parse_args()
+    main()
