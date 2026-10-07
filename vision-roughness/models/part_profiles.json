@@ -16,7 +16,7 @@
     "feature": "countersink",
     "bolt_angles_rel": null,
     "bolt_circle_ratio": 0.78,
-    "mm_per_px": 0.032658,
+    "mm_per_px": 0.03265837402143378,
     "_备注": "od_mm 是当初 --ref-mm 用过的卡尺真值；孔径/螺栓孔标称值用户还没给，留 null（不给就不判 OK/NG）"
   },
   "型号2-4孔圆盘": {
@@ -26,9 +26,14 @@
     "bolt_mm": 1.78,
     "bolt_count": 4,
     "feature": "core_hole",
-    "bolt_angles_rel": [0.0, 72.8, 180.2, 252.2],
+    "bolt_angles_rel": [
+      0.0,
+      72.8,
+      180.2,
+      252.2
+    ],
     "bolt_circle_ratio": 0.818,
-    "mm_per_px": 0.048366,
+    "mm_per_px": 0.04836640294230451,
     "_备注": [
       "无中心孔（实心盘），所以 id_mm=null 且检测不走中心孔那一段。",
       "bolt_mm=1.78 指紧固件中间那个暗芯通孔；实测暗芯 36.4px≈1.759mm，差 1.1%。",
