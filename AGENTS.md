@@ -86,11 +86,14 @@ mm 读数 = 像素 × `models/mm_per_pixel.json` 的系数，改这个 json 会�
 ## 4. 不可动 / 不入库 / 明确禁止
 
 - **`models/mm_per_pixel.json` 不要改。** 它是「相机 + 镜头 + 拍摄距离」的函数，只有换相机 /
-  镜头 / 机位才用 `--ref-mm` 重建（`measure_ring.py:108-122` 会覆写它）。**不要为了「让读数
+  镜头 / 机位才用 `--ref-mm` 重建（`measure_ring.py:136` 起会覆写它）。**不要为了「让读数
   对上标称值」去调它**——那是伪造数据。
-- **不入库**（`.gitignore`）：`debug/`、`vision-roughness/data/captures/*`（仅保留
-  `capture_single_20260730_203312.jpg`）、`venv/`、`.zcode/`、`**/temp/*`（仅保留
-  `hik_debug.py`）、`**/models/*.pth`。新增运行时产物放这些目录里，不要 `git add`。
+- **`models/part_profiles.json`（型号档案）也不要为了凑读数去改。** 里面的 `od_mm` 是卡尺
+  真值、`mm_per_px` 是由它标定出来的；改它同样等于伪造数据。换型号才新增档案。
+- **不入库**（`.gitignore`）：`debug/`、`vision-roughness/data/captures/*`、`venv/`、`.zcode/`、
+  `**/temp/*`（仅保留 `hik_debug.py`）、`**/models/*.pth`。新增运行时产物放这些目录里，
+  不要 `git add`。（原先 `data/captures/` 里有一个例外 `capture_single_20260730_203312.jpg`，
+  2026-10-07 用户确认删除，例外一并从 `.gitignore` 去掉。）
 - `测量.bat` 内容必须 **ASCII + CRLF**（内部走 `pythonw` + `gui_ring.py`）。存成 UTF-8 或 LF
   会让 cmd 报错。
 - 不要重新引入 `7375601` 删掉的粗糙度分类线 / 棋盘格标定路线。
@@ -98,11 +101,16 @@ mm 读数 = 像素 × `models/mm_per_pixel.json` 的系数，改这个 json 会�
 
 ## 5. 领域陷阱（按这些结论行事，别自己推）
 
-- **螺栓孔测的是沉孔口口径**（含沉孔锥度；`measure_ring.py:222`、
-  `fit_ellipse_ring.py:259 rim_cross_points` 的 norm<0.72 阈值交叉），**不是螺纹孔径**。
+- **螺栓孔测的是沉孔口口径**（含沉孔锥度；`measure_ring.py:269`、
+  `fit_ellipse_ring.py:265 rim_cross_points` 的 norm<0.72 阈值交叉），**不是螺纹孔径**。
   6 孔读数分散 154.5~176.3px ≈ ±7%（含斜视透视 + 沉孔口定义差异），**不得据此判定尺寸超差**。
+- **型号 2（`feature="core_hole"`）的"孔"是装好的紧固件，不是裸沉孔**：中间暗芯 + 外面
+  亮金属环 + 两侧亮叶片。它的孔径按**暗芯的中分界**定义（`core_cross_points`，刻意不用
+  最陡梯度——后者量成 50.7px、偏标称 38%，中分界只偏 1%）。实测 4 孔单孔离散 **±15%**
+  （1.607~2.144mm，标称 1.78），**同样不得据此判定尺寸超差**。暗芯边界一侧常连到阴影，
+  要提精度得改定义或补光，不是调参能救的。
 - **不传 `--spec-*` 时 `overall_judged=False`**，GUI 显示「已测量」（`gui_ring.py:550-553`），
-  但 CLI 仍会打印「综合判定: OK」（`measure_ring.py:227`）。**这个 OK 不是合格判定**，只是
+  但 CLI 仍会打印「综合判定: OK」（`measure_ring.py:274`）。**这个 OK 不是合格判定**，只是
   「未判定」时的默认串。要真判定必须给 `--spec-od` / `--spec-id` / `--spec-bolt`。
 - **精度天花板**：单像素 ≈0.0327mm，5 丝(±0.05mm) ≈1.5px；当前机位（斜视 23°、沉孔缓坡
   边缘定位误差 ±3~5px）**达不到**。不要承诺 ±0.05mm，也不要用这套读数做超差判据。
@@ -115,18 +123,37 @@ mm 读数 = 像素 × `models/mm_per_pixel.json` 的系数，改这个 json 会�
 
 - **换相机 / 曝光 / 增益**：只改 `src/config.py` 的 `CAMERA_TYPE` + `CAMERA_KWARGS`——这是
   换相机的唯一改动点，业务代码不许动。
+- **曝光默认自动标定**（2026-10-07 加）：`auto_exposure=True` 时开机二分几帧、把平均亮度
+  调到 `auto_target`(110) 再锁定，`auto_max_us`(200ms) 是上限。**开机因此要多等 1~3 秒**，
+  且最暗时实时取景会掉到约 5 fps。定标只跑一次，同一次开机内读数仍可复现；要严格复现
+  历史读数就设 `auto_exposure=False` 并用固定 `exposure_us`。
 - **相机接入抽象层**：`src/camera_adapter.py`（`webcam` / `file` / `hikvision` 三实现，
-  `create_camera()` 在 `:327`），海康 DLL 搜索路径由它自动补。
-- **检测管线核心**：`src/fit_ellipse_ring.py` 的 `detect()`（`:365`，返回
-  `{"outer","center_hole","bolts"}`）。几何算法都改这里。
-- **`find_edge_points`（`:28`）的梯度算在未平滑的原始径向剖面上**。历史代码里有一行
+  `create_camera()` 在 `:395`），海康 DLL 搜索路径由它自动补。
+- **检测管线核心**：`src/fit_ellipse_ring.py` 的 `detect()`（`:615`，返回
+  `{"outer","center_hole","bolts"}`）。几何算法都改这里。`detect(img, init_c, init_r, profile)`
+  的 `profile` 是型号档案 dict；**不传 profile 时行为与旧版逐字符一致**（回归门依赖这一点）。
+- **外圈定位是自适应的**：`_outer_candidates`（`:430`）按顺序给候选——旧先验（图像中心 +
+  0.44×短边 + 下降沿）排第一保基线，之后才是「候选圆心 × 径向峰半径 × 两种极性」。
+  它是个**生成器**，边缘图/直方图在继续迭代时才算，所以旧先验一过门槛就 break，
+  自适应那 ~135ms 开销只在快速路径失败时才付。门槛见 `_outer_ok`（`:493`）与顶部
+  `OUTER_*` 常量；**判据只用点数/轴比/画幅，不能用残差 RMS**（基线自身 41px、
+  错误极性 40.6px，区分不开）。
+- **`find_edge_points`（`:34`）的梯度算在未平滑的原始径向剖面上**。历史代码里有一行
   `cv2.GaussianBlur(gi.reshape(1, -1), (1, 7), 0)`，但 `cv::Size` 是(宽,高)：宽 1 的核 +
   单行图是**恒等操作**（实测最大差 0.0），已于 2026-10-07 删除，读数不变。**要加平滑就是
   改所有读数**——堆 `(n_ray, L)` 配 `(1,7)` 是沿剖面平滑、配 `(7,1)` 是跨射线平滑，两者
   都会动外径/孔径，属于测量定义变更，不要顺手混进清理提交。
-- **结果唯一来源**：`src/measure_ring.py` 的 `measure()`（`:125`）产出 `RingResult`（`:49`）。
+- **结果唯一来源**：`src/measure_ring.py` 的 `measure()`（`:163`）产出 `RingResult`（`:77`）。
   CLI 打印它，GUI 显示它（`gui_ring.py:245` 直接调 `measure()`）——**不要在 `gui_ring.py` 里
   自己再算一遍尺寸**。
+- **型号档案与 `--profile`**：`models/part_profiles.json` 是**新文件**（2026-10-07 加），
+  与 `mm_per_pixel.json` 不是一回事——前者是每型号一组标称值+检测参数，后者是单个标量缓存。
+  `load_profile`（`measure_ring.py:46`）读档案；`--profile` + `--ref-mm` 会把标定出的
+  `mm_per_px` **写回档案**（`save_profile_mm_per_px`，`:65`）。
+  档案的 `feature` 决定走哪条螺栓孔路：`countersink`（型号1）走模板匹配+六边形校验（老路），
+  `core_hole`（型号2）走 `profile_slots`（`:588`，按 `bolt_angles_rel` 相对角度做相位搜索）
+  + `measure_core_hole`（`:566`）。**`core_hole` 不依赖中心孔**，所以型号2 那种实心盘
+  （`has_center_hole=false`）不会被 `if hole is not None` 挡掉整段。
 - **显示层**：`src/gui_ring.py` 只做显示/交互，不改数值。它还负责**实时取景**，所以有一条
   额外硬约束：取帧与测量**只在同一个后台线程**（`gui_ring.py::LiveSource`）里做，**绝不能让
   两个线程同时 `capture()`**（相机是独占资源）；tkinter 只能在主线程碰，所以后台线程只往
@@ -139,9 +166,9 @@ mm 读数 = 像素 × `models/mm_per_pixel.json` 的系数，改这个 json 会�
 
 ## 7. 约定与提交风格
 
-- 中文注释 / docstring / 用户可见输出；报告文件写 UTF-8（`measure_ring.py:246`）。
-- `MeasureError`（`measure_ring.py:45`）表示**「可预期、需原样提示给用户」的失败**（读图失败、
-  外圈拟合失败等），`main()` 会把它直接转成一句中文退出（`:263-264`）。**代码缺陷不要用
+- 中文注释 / docstring / 用户可见输出；报告文件写 UTF-8（`measure_ring.py:293`）。
+- `MeasureError`（`measure_ring.py:72`）表示**「可预期、需原样提示给用户」的失败**（读图失败、
+  外圈拟合失败等），`main()` 会把它直接转成一句中文退出（`:310-311`）。**代码缺陷不要用
   MeasureError 包**，要让真实 traceback 抛出来。
 - 提交信息：**中文 + `type:` 前缀**，对标现有 history（`feat` / `fix` / `refactor` / `docs` /
   `chore`，例如 `refactor: 移除粗糙度分类线与旧尺寸测量路线，仅保留圆环尺寸测量`）。

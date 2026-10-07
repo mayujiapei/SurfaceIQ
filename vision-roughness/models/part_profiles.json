@@ -1,0 +1,39 @@
+{
+  "_说明": [
+    "零件型号档案。每个型号一组标称值与检测参数；不传 --profile 时行为与以前完全一致（走老路）。",
+    "od_mm 既是 OK/NG 的标称外径，也是本型号 mm/px 的标定依据（换型号必须重新用卡尺量外径）。",
+    "mm_per_px 单独存：不同型号往往要换机位，尺度跟着机位走，不能跨型号复用。",
+    "feature: countersink=型号1那类暗沉孔口（沿用原有模板匹配+螺丝头锚定那条路）；",
+    "         core_hole=型号2那类装好紧固件的暗芯圆孔（按 bolt_angles_rel 定位、量暗芯）。",
+    "bolt_angles_rel: 各孔相对第 1 个孔的角度偏移（度）。型号2 是 2x2 矩形布局，不是 90 等分。"
+  ],
+  "型号1-6孔圆环": {
+    "od_mm": 88.6,
+    "id_mm": null,
+    "has_center_hole": true,
+    "bolt_mm": null,
+    "bolt_count": 6,
+    "feature": "countersink",
+    "bolt_angles_rel": null,
+    "bolt_circle_ratio": 0.78,
+    "mm_per_px": 0.032658,
+    "_备注": "od_mm 是当初 --ref-mm 用过的卡尺真值；孔径/螺栓孔标称值用户还没给，留 null（不给就不判 OK/NG）"
+  },
+  "型号2-4孔圆盘": {
+    "od_mm": 126.0,
+    "id_mm": null,
+    "has_center_hole": false,
+    "bolt_mm": 1.78,
+    "bolt_count": 4,
+    "feature": "core_hole",
+    "bolt_angles_rel": [0.0, 72.8, 180.2, 252.2],
+    "bolt_circle_ratio": 0.818,
+    "mm_per_px": 0.048366,
+    "_备注": [
+      "无中心孔（实心盘），所以 id_mm=null 且检测不走中心孔那一段。",
+      "bolt_mm=1.78 指紧固件中间那个暗芯通孔；实测暗芯 36.4px≈1.759mm，差 1.1%。",
+      "bolt_angles_rel 由实测角度 65.8/138.6/246.0/318.0 换算（矩形布局，非 90 等分）。",
+      "mm_per_px = 126.0 / 2605.1px（2026-10-07 实拍盘径）。"
+    ]
+  }
+}

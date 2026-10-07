@@ -70,6 +70,7 @@ venv\Scripts\python.exe -c "import cv2, numpy; print(cv2.__version__, numpy.__ve
 venv\Scripts\python.exe src\measure_ring.py                          # 相机现拍并测量
 venv\Scripts\python.exe src\measure_ring.py --image ..\data\captures\capture_20260908_115557.jpg
 venv\Scripts\python.exe src\measure_ring.py --ref-mm 88.60           # 用外径真值重建换算系数
+venv\Scripts\python.exe src\measure_ring.py --image xxx.jpg --profile 型号2-4孔圆盘   # 按型号档案测
 ```
 
 > **两个 `data\captures\` 别搞混**：标准验证照片在**仓库根**的 `data\captures\`，
@@ -80,6 +81,7 @@ venv\Scripts\python.exe src\measure_ring.py --ref-mm 88.60           # 用外径
 | 参数 | 说明 |
 |---|---|
 | `--image <路径>` | 测已有照片；不指定则相机现拍 |
+| `--profile <型号名>` | 按 `models/part_profiles.json` 里的型号档案测（见下节）|
 | `--ref-mm <mm>` | 零件**外径真值**，用于建立 mm/px 换算系数并缓存 |
 | `--mm-per-px <系数>` | 直接指定换算系数，绕过标定 |
 | `--spec-od / --spec-id / --spec-bolt <mm>` | 外径 / 中心孔 / 螺栓孔**标称值**，用于 OK/NG |
@@ -90,14 +92,41 @@ venv\Scripts\python.exe src\measure_ring.py --ref-mm 88.60           # 用外径
 
 ---
 
+## 换型号（型号档案）
+
+不同型号的零件，外圈大小、孔径、孔数、**孔的分布**甚至"孔长什么样"都不一样，
+所以每款零件在 `vision-roughness/models/part_profiles.json` 里存一份档案，用 `--profile` 选：
+
+| 字段 | 含义 |
+|---|---|
+| `od_mm` | 外径**卡尺真值**（同时是本型号 mm/px 的标定依据）|
+| `id_mm` / `has_center_hole` | 中心孔标称值；有没有中心孔 |
+| `bolt_mm` / `bolt_count` | 螺栓孔标称值；孔数 |
+| `bolt_angles_rel` | 各孔**相对**第 1 个孔的角度偏移（支持非等分布局）|
+| `bolt_circle_ratio` | 孔心圆半径 ÷ 外圈半径 |
+| `feature` | `countersink`=暗沉孔口那类；`core_hole`=装好紧固件的暗芯孔那类 |
+| `mm_per_px` | 本型号的换算系数（**每个型号各一份**，尺度跟着机位走，不能跨型号复用）|
+
+**新做一款零件**：加一条档案 → 卡尺量外径 → `--profile <型号名> --ref-mm <外径>` 标定一次
+（系数会**写回档案**）→ 之后该型号直接 `--profile <型号名>` 就能测。
+
+> 不传 `--profile` 时行为与以前完全一致，老用法不受影响。
+
+---
+
 ## 检测管线
 
 核心在 `src/fit_ellipse_ring.py::detect()`：
 
 1. **外圈** —— 72 条射线从外向内找最外侧强下降沿（抛物线插值到亚像素）+ 圆等价
    归一化距离滤离群 + 椭圆鲁棒拟合；再用粗结果做紧窗口精化。
+   **定位是自适应的**：先按老先验（零件在画面正中 + 外圈半径 ≈ 短边的 44% + 下降沿）试，
+   不行才换「候选圆心 × 径向直方图峰半径 × 两种极性」逐个打分，够可信才采用。
+   所以零件偏出画面中心、换机位改变成像大小、或者零件比背景亮（上升沿）都能测到；
+   老先验排在候选首位，所以原来能测的图读数逐位不变。
 2. **中心孔** —— 同一套射线法找暗→亮的上升沿。
-3. **螺栓孔** —— 三步：
+3. **螺栓孔** —— 按型号档案的 `feature` 分两条路：
+   - `countersink`（暗沉孔口那类）走下面三步：
    - 粗暗斑挖 250×250 模板 → 1/3 缩比模板匹配（`TM_CCOEFF_NORMED`）取峰；
    - **六孔等角共圆校验**：转到外圈椭圆归一化坐标系，用 RANSAC 思路选相位锚，
      生成 6 个 60° 等角槽位 —— 同时完成「滤假峰」和「补缺失孔」；
@@ -105,6 +134,10 @@ venv\Scripts\python.exe src\measure_ring.py --ref-mm 88.60           # 用外径
      取第一个**宽度 ≥12px** 的游程末端、按固定亮度阈值交叉定出**沉孔口**
      （跳过 5~15px 的螺丝槽纹/头影，防提前交叉）→ 极化残差**渐缩迭代**椭圆拟合
      （2.5×中位残差 → 1.0×中位，甩开与暗带粘连的远点；轴比 1.0~2.2 防塌陷）。
+   - `core_hole`（装好紧固件的暗芯孔那类）另走一条：按档案的**相对角度 + 相位搜索**
+     定位各孔（支持非等分布局，如 2×2 矩形），再从暗芯向外找**亮度中分界**、取
+     **中位半径**当直径（刻意不拟合椭圆：暗芯一侧常连到阴影，一拟合就被拉长）。
+     这条路**不需要中心孔**，所以实心盘也能测。
 
 ---
 
@@ -170,6 +203,7 @@ SurfaceIQ/
 │   │   └── explore_ring.py / profile_ring.py / ray_ring.py / edge_ring.py
 │   │                            开发期图像诊断工具（见文末）
 │   ├── models/mm_per_pixel.json mm/px 换算系数缓存（换机位要重建）
+│   ├── models/part_profiles.json 型号档案（标称值 / 孔数 / 孔位角度 / 各型号 mm/px）
 │   ├── debug/                   每次测量的调试图 + 文字报告 + GUI 日志（未入库）
 │   ├── data/captures/           采集的图片（未入库）
 │   ├── temp/hik_debug.py        海康取图故障排查脚本

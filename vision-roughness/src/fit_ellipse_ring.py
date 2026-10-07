@@ -15,6 +15,12 @@ import numpy as np
 
 N_RAY = 72
 
+# 外圈候选的可信门槛（自适应定位用；实测依据见 docs/自适应定位改造计划.md）
+OUTER_COVER_MIN = 0.6        # 保留点数 ≥ 射线数×此比例（误锁只有 22/72，正确为 54~72/72）
+OUTER_AXIS_RATIO_MAX = 1.8   # 外圈长短轴比上限（斜视视角的物理上限）
+OUTER_MAX_CANDIDATES = 60    # 候选上限，防自适应搜索跑飞
+OUTER_CENTER_MIN_RATIO = 0.5  # 圆心最强径向峰 < 全局最强峰×此比例就丢弃（零件不在这儿）
+
 
 # ---------------- 射线亚像素边缘 ----------------
 
@@ -362,8 +368,256 @@ def measure_bolt(norm, x, y):
     return ell, n, (hx, hy)
 
 
-def detect(img, init_c=None, init_r=None):
+def _edge_map(gray):
+    """Otsu 定阈值 -> Canny 边缘图（配方沿用诊断脚本 profile_ring.py）。"""
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    thr, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return cv2.Canny(blur, int(thr * 0.3), int(thr * 0.9))
+
+
+def _coarse_centers(gray, edges):
+    """候选圆心：图像中心(保底) + 边缘密度质心 + Otsu 最大轮廓外接圆心。
+
+    实测（型号2 偏置图，盘心偏出画面中心 604px）：后两个各自都能独立得到正确
+    结果，且三者互相一致——所以不需要哪一个特别准，多给几个让打分去挑。
+    """
+    h, w = gray.shape
+    out = [(w / 2.0, h / 2.0)]
+    ys, xs = np.nonzero(edges[::16, ::16])
+    if len(xs) >= 10:
+        out.append((float(xs.mean() * 16), float(ys.mean() * 16)))
+    try:
+        _, bw = cv2.threshold(cv2.GaussianBlur(gray, (9, 9), 0), 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if cnts:
+            (ccx, ccy), _ = cv2.minEnclosingCircle(max(cnts, key=cv2.contourArea))
+            out.append((float(ccx), float(ccy)))
+    except cv2.error:
+        pass
+    return out
+
+
+def _radial_peaks(ey, ex, cx, cy, r_min, r_max, top=6, bin_px=2.0, merge_ratio=0.08):
+    """边缘点到 (cx,cy) 的距离直方图取峰 = 候选外圈半径。返回 [(峰点数, 半径)]。
+
+    真实圆在"边缘点距离"直方图上形成尖峰，噪声弧则弥散（续 profile_ring.py 的思路）。
+    实测型号2：盘缘峰宽仅 6px。
+
+    **邻近峰要合并**（merge_ratio=8%）：圆心估不准时真半径会被抹成一片，
+    1143/1149/1157 这种邻居其实都指向同一个答案，全试一遍纯属浪费。
+    ey/ex 是 np.nonzero(edges) 的结果，调用方算一次传进来。
+    """
+    d = np.hypot(ex - cx, ey - cy)
+    d = d[(d >= r_min) & (d <= r_max)]
+    if len(d) < 100:
+        return []
+    bins = np.arange(r_min, r_max + bin_px, bin_px)
+    hist, _ = np.histogram(d, bins=bins)
+    centers = bins[:-1] + bin_px / 2
+    raw = [(int(hist[i]), float(centers[i])) for i in range(1, len(hist) - 1)
+           if hist[i] >= hist[i - 1] and hist[i] >= hist[i + 1]]
+    raw.sort(key=lambda t: -t[0])
+    out = []
+    for cnt, r in raw:
+        if all(abs(r - r2) > r2 * merge_ratio for _, r2 in out):
+            out.append((cnt, r))
+        if len(out) >= top:
+            break
+    return out
+
+
+def _outer_candidates(gray, w, h, cx0, cy0, init_r):
+    """外圈候选 (cx, cy, r0, polarity)，**旧先验排最前以保证基线读数不变**。
+
+    历史先验只假设了"零件在画面正中 + 外圈半径 ≈ 短边的 44% + 边缘是亮→暗"，
+    零件一挪位置/换型号就全废。数据驱动的候选由
+    「候选圆心 × 径向峰半径 × 两种极性」组成。
+
+    极性必须一起试：型号1 是暗金属在白背景上（下降沿，72/72），型号2 是灰盘放在
+    白布上、盘外更亮（上升沿 55/72，下降沿只有 22/72）——写死下降沿直接废掉。
+
+    这是个生成器：旧先验那三个候选排在前面，**边缘图与直方图是等它被继续迭代时
+    才算的**。所以旧先验一旦过了门槛就 break，自适应那套开销（实测约 400ms）
+    根本不会发生——只有快速路径失败时才付这个代价。
+    """
+    short = min(w, h)
+    for r0 in [init_r or short * 0.44, short * 0.40, short * 0.48]:
+        yield cx0, cy0, r0, -1
+    try:
+        edges = _edge_map(gray)
+    except cv2.error:
+        return
+    ey, ex = np.nonzero(edges)
+    if len(ex) < 100:
+        return
+    per_center = []
+    for (ccx, ccy) in _coarse_centers(gray, edges):
+        peaks = _radial_peaks(ey, ex, ccx, ccy, short * 0.10, short * 0.55, top=6)
+        if peaks:
+            per_center.append(((ccx, ccy), peaks))
+    if not per_center:
+        return
+    # 峰最弱的圆心直接丢：零件不在那儿，试也是白试。实测型号2 图像中心的最强峰
+    # 只有最佳圆心的 41%，丢得掉；零件真居中时它本来就是最强的，留得下。
+    strongest = max(p[1][0][0] for p in per_center)
+    n = 0
+    for (ccx, ccy), peaks in per_center:
+        if peaks[0][0] < strongest * OUTER_CENTER_MIN_RATIO:
+            continue
+        for _, r in peaks:
+            for pol in (-1, +1):
+                n += 1
+                if n > OUTER_MAX_CANDIDATES:
+                    return
+                yield ccx, ccy, float(r), pol
+
+
+def _fit_outer_at(sm, cx, cy, r0, pol):
+    """单个粗候选：射线找边 + 鲁棒圆滤 + 椭圆拟合。"""
+    pts = find_edge_points(sm, cx, cy, r0 * 0.88, r0 * 1.16, pol, 2.0, n_ray=N_RAY,
+                           mode="outer_first")
+    return filter_and_fit(pts, cx, cy, r0)
+
+
+def _refine_outer(sm, ell, n, pol):
+    """粗结果精化：以粗椭圆中心/半径做紧窗口再采一轮（仍取最外侧边缘）。"""
+    (cx1, cy1), (aa1, aa2), _ = ell
+    req = (aa1 + aa2) / 4
+    pts = find_edge_points(sm, cx1, cy1, req * 0.93, req * 1.07, pol, 2.0, n_ray=N_RAY,
+                           mode="outer_first")
+    ell2, n2 = filter_and_fit(pts, cx1, cy1, req * 1.0)
+    return (ell2, n2) if ell2 is not None else (ell, n)
+
+
+def _outer_ok(ell, n, w, h):
+    """外圈候选是否可信：点数够 + 轴比合理 + 不出画幅。
+
+    **残差 RMS 不能当门槛**：实测基线自身就有 41px、错误极性在标定图上也有 41px
+    （斜视外缘本身是个有厚度的带，不是一条线），两者区分不开。点数和画幅才管用：
+    型号2 那次误锁用点只有 22/72，外接框还溢出画幅（x 到 -48、y 到 3174），
+    两条里任意一条都挡得住。
+    """
+    if n < OUTER_COVER_MIN * N_RAY:
+        return False
+    (cx, cy), (a1, a2), _ = ell
+    if min(a1, a2) <= 0 or max(a1, a2) / min(a1, a2) > OUTER_AXIS_RATIO_MAX:
+        return False
+    s = max(a1, a2) / 2          # 保守：按长半轴当各向外接半径
+    return (cx - s >= 0) and (cx + s <= w) and (cy - s >= 0) and (cy + s <= h)
+
+
+# ---------------- 型号档案驱动的螺栓孔（装好紧固件的暗芯圆孔） ----------------
+
+def core_cross_points(gray, x, y, r_lo, r_hi, n_ray=48, frac=0.5):
+    """从暗芯向外：灰度升到 (芯内 + frac×(外侧-芯内)) 的亚像素交叉点。
+
+    型号2 的"孔"是装好的紧固件：中间一个暗芯 + 外面一圈亮金属环，跟型号1 的
+    "暗沉孔 + 亮螺丝头"正好反着。实测(2026-10-07)这个**中分界**定义对得上标称
+    1.78mm（36.4px vs 标称 36.8px，差 1.1%），而用 find_edge_points 的"最陡上升沿"
+    会量成 50.7px（偏 38%）——所以这里刻意不复用最陡梯度那套。
+    """
+    pts = []
+    for k in range(n_ray):
+        ang = 2 * np.pi * k / n_ray
+        d, gv = ray_profile(gray, x, y, ang, r_hi)
+        m = (d >= r_lo) & (d <= r_hi)
+        dd, gg = d[m], gv[m]
+        if len(gg) < 8:
+            continue
+        lo_v = float(gg[:max(1, len(gg) // 4)].min())      # 内侧 = 暗芯
+        hi_v = float(np.median(gg[len(gg) // 2:]))         # 外侧 = 亮环
+        if hi_v - lo_v < 8:                                # 对比度不够就别硬给点
+            continue
+        thr = lo_v + frac * (hi_v - lo_v)
+        idx = np.where(gg > thr)[0]
+        if len(idx) == 0:
+            continue
+        i = int(idx[0])
+        if i == 0:
+            r = dd[0]
+        else:
+            dr = gg[i] - gg[i - 1]
+            r = dd[i - 1] + (thr - gg[i - 1]) * (dd[i] - dd[i - 1]) / dr if dr else dd[i]
+        pts.append((x + np.cos(ang) * r, y + np.sin(ang) * r))
+    return np.array(pts).reshape(-1, 2) if pts else np.zeros((0, 2))
+
+
+def core_seed(sm, x, y, r_exp):
+    """把种子点挪到暗芯的亮度重心上。
+
+    相位搜索给的位置有十几 px 误差，而暗芯半径才 ~20px——偏这么多会让射线上的
+    中分界系统性外扩（实测某一个孔因此从 40px 涨到 47.7px，是 4 孔里唯一的离群）。
+    """
+    w = int(max(6.0, r_exp * 1.2))
+    x0, y0 = max(0, int(x) - w), max(0, int(y) - w)
+    x1, y1 = min(sm.shape[1], int(x) + w), min(sm.shape[0], int(y) + w)
+    loc = sm[y0:y1, x0:x1].astype(float)
+    if loc.size < 4:
+        return float(x), float(y)
+    thr = loc.min() + 0.5 * (float(np.median(loc)) - loc.min())
+    wgt = np.clip(thr - loc, 0.0, None)
+    if wgt.sum() <= 0:
+        return float(x), float(y)
+    ys, xs = np.mgrid[y0:y1, x0:x1]
+    return float((xs * wgt).sum() / wgt.sum()), float((ys * wgt).sum() / wgt.sum())
+
+
+def measure_core_hole(sm, x, y, r_exp):
+    """量暗芯圆孔：先把种子挪到暗芯重心 -> 射线找中分界 -> 中位半径当直径。
+    返回 ((cx,cy), dia_px, 方向数)。
+
+    这里**刻意不拟合椭圆**：实测暗芯有一侧常连到阴影，一拟合就被拉成 1.3 左右的轴比、
+    均值因此偏高 7~11%（4 孔 1.66~2.28mm）；中位半径对少数方向上的粘连不敏感，
+    4 孔均值对上标称 1.78mm 只差 1% 量级。
+    代价是丢掉椭圆方位——型号2 这种接近正拍的机位不需要它。
+    """
+    x, y = core_seed(sm, x, y, r_exp)
+    pts = core_cross_points(sm, x, y, r_exp * 0.4, r_exp * 2.2)
+    if len(pts) < 12:
+        return None, 0.0, len(pts)
+    d = np.hypot(pts[:, 0] - x, pts[:, 1] - y)
+    med = float(np.median(d))
+    keep = np.abs(d - med) <= max(med * 0.25, 3.0)
+    if keep.sum() >= 12:
+        pts, d = pts[keep], d[keep]
+    cx, cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
+    return (cx, cy), 2.0 * float(np.median(d)), int(len(d))
+
+
+def profile_slots(profile, norm, ocx, ocy, oa1, oa2, oang, phase_step=1.0):
+    """按档案的显式角度定位各孔：先扫整体相位，再给出各孔角度。
+
+    型号2 的 4 孔是 2x2 矩形布局（实测相邻间隔 72.8/107.4/72.0/107.8°，**不是 90° 等分**），
+    所以不能沿用"等分 N 槽"。档案里存的是**相对角度**，绝对相位由图像数据自己找
+    （扫一圈让模板角度尽量落在暗处），零件转个角度也不怕。
+    """
+    rel = profile.get("bolt_angles_rel")
+    if not rel:
+        return None
+    rel = np.asarray(rel, float)
+    r_norm = float(profile.get("bolt_circle_ratio", 0.8))
+    h, w = norm.shape
+    best, best_ph = None, 0.0
+    for ph in np.arange(0.0, 360.0, phase_step):
+        xs, ys = from_norm(np.cos(np.deg2rad(ph + rel)) * r_norm,
+                           np.sin(np.deg2rad(ph + rel)) * r_norm, ocx, ocy, oa1, oa2, oang)
+        vals = [norm[int(round(y)), int(round(x))] for x, y in zip(xs, ys)
+                if 0 <= int(round(y)) < h and 0 <= int(round(x)) < w]
+        if len(vals) < len(rel):
+            continue
+        score = -float(np.mean(vals))          # 孔是暗的：越暗越像
+        if best is None or score > best:
+            best, best_ph = score, float(ph)
+    return [(best_ph + a) % 360 for a in rel], r_norm
+
+
+def detect(img, init_c=None, init_r=None, profile=None):
     """完整检测管线(BGR图 -> 测量结果 dict)。
+
+    profile: 型号档案(dict)。None 时行为与无档案版本完全一致（基线路径）。
+             feature="core_hole" 的型号（装好紧固件的暗芯圆孔）会改走
+             profile_slots + measure_core_hole，不再依赖中心孔。
 
     返回:
         outer: (center,(axis1,axis2),angle[,n]) 或 None
@@ -375,25 +629,19 @@ def detect(img, init_c=None, init_r=None):
     h, w = gray.shape
     sm = cv2.GaussianBlur(gray, (0, 0), 5)
 
-    # ---- 外圈: 从图像中心 + 粗略半径(0.44*短边)起, 失败则试探几个半径 ----
+    # ---- 外圈: 旧先验优先(保基线)，不行再自适应定位 ----
     cx0, cy0 = init_c or (w / 2, h / 2)
     outer = n_o = None
-    for r0 in [init_r or min(w, h) * 0.44, min(w, h) * 0.40, min(w, h) * 0.48]:
-        pts = find_edge_points(sm, cx0, cy0, r0 * 0.88, r0 * 1.16, -1, 2.0, n_ray=72,
-                               mode="outer_first")
-        outer, n_o = filter_and_fit(pts, cx0, cy0, r0)
-        if outer is not None:
+    for (cx, cy, r0, pol) in _outer_candidates(gray, w, h, cx0, cy0, init_r):
+        ell, n = _fit_outer_at(sm, cx, cy, r0, pol)
+        if ell is None:
+            continue
+        ell, n = _refine_outer(sm, ell, n, pol)
+        if _outer_ok(ell, n, w, h):
+            outer, n_o = ell, n
             break
     if outer is None:
         return {"outer": None, "center_hole": None, "bolts": []}
-    # 粗结果精化: 以粗椭圆中心/半径做紧窗口再采一轮(仍取最外侧边缘)
-    (cx1, cy1), (aa1, aa2), _ = outer
-    req = (aa1 + aa2) / 4
-    pts = find_edge_points(sm, cx1, cy1, req * 0.93, req * 1.07, -1, 2.0, n_ray=72,
-                           mode="outer_first")
-    outer2, n2 = filter_and_fit(pts, cx1, cy1, req * 1.0)
-    if outer2 is not None:
-        outer, n_o = outer2, n2
     (ocx, ocy), (oa1, oa2), oang = outer
 
     # ---- 中心孔: 外圈内暗->亮的上升沿 ----
@@ -406,9 +654,33 @@ def detect(img, init_c=None, init_r=None):
     else:
         (hcx, hcy), (ha1, ha2), hang = hole
 
-    # ---- 螺栓孔: 模板定位 + 等角校验 -> 每孔亚像素椭圆拟合 ----
+    # ---- 螺栓孔 ----
     bolts = []
-    if hole is not None:
+    prof = profile or {}
+    mmpx = prof.get("mm_per_px")
+    if (prof.get("feature") == "core_hole" and prof.get("bolt_angles_rel")
+            and prof.get("bolt_mm") and mmpx):
+        # 装好紧固件的"暗芯圆孔"型号（型号2）：按档案角度定位，量暗芯。
+        # 这条路不需要中心孔，所以不走下面那个 `if hole is not None` 的门。
+        norm = sm / np.maximum(cv2.blur(sm, (201, 201)), 1)
+        slots = profile_slots(prof, norm, ocx, ocy, oa1, oa2, oang)
+        sm2 = cv2.GaussianBlur(gray, (0, 0), 2)      # 暗芯只有几十 px，σ=5 会糊过头
+        r_exp = (float(prof["bolt_mm"]) / 2) / float(mmpx)
+        if slots:
+            angs_abs, r_norm = slots
+            for ang_abs in angs_abs:
+                x, y = from_norm(np.cos(np.deg2rad(ang_abs)) * r_norm,
+                                 np.sin(np.deg2rad(ang_abs)) * r_norm,
+                                 ocx, ocy, oa1, oa2, oang)
+                ell, dia, n = measure_core_hole(sm2, x, y, r_exp)
+                if ell is None:
+                    bolts.append({"cx": x, "cy": y, "dia": 0.0, "a1": 0.0, "a2": 0.0,
+                                  "n": n, "status": "失败"})
+                    continue
+                (ex, ey) = ell
+                bolts.append({"cx": ex, "cy": ey, "dia": dia, "a1": dia, "a2": dia,
+                              "ang": 0.0, "n": n, "status": "OK"})
+    elif hole is not None:
         band = np.zeros((h, w), np.uint8)
         cv2.ellipse(band, (int(ocx), int(ocy)),
                     (int(oa1 / 2 * 0.98), int(oa2 / 2 * 0.98)), oang, 0, 360, 255, -1)

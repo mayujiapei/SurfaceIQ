@@ -12,7 +12,6 @@ __pycache__/
 # 运行时产物（每次测量/调试自动生成，不进入仓库）
 debug/
 vision-roughness/data/captures/*
-!vision-roughness/data/captures/capture_single_20260730_203312.jpg
 # temp/ 下只保留排查脚本 hik_debug.py，其余忽略
 **/temp/*
 !**/temp/hik_debug.py

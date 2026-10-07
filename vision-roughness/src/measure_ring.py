@@ -38,8 +38,35 @@ from camera_adapter import create_camera
 from fit_ellipse_ring import detect
 
 RATIO_CACHE = Path("models/mm_per_pixel.json")
+PROFILE_PATH = Path("models/part_profiles.json")
 DEBUG_DIR = Path("debug")
 BORDER_MARGIN = 5  # 轮廓距图像边缘小于此值视为"零件超出视野"
+
+
+def load_profile(name):
+    """读型号档案（models/part_profiles.json）。不传 --profile 返回 None。
+
+    返回的 dict 里额外带 _name，便于报错和报告里写明用的是哪个型号。
+    没有档案时检测行为与以前完全一致（走老路），所以不传参数的用法不受影响。
+    """
+    if not name:
+        return None
+    if not PROFILE_PATH.exists():
+        raise MeasureError(f"找不到型号档案: {PROFILE_PATH}")
+    profiles = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    if name not in profiles:
+        have = "、".join(k for k in profiles if not k.startswith("_"))
+        raise MeasureError(f"型号档案里没有「{name}」。现有型号：{have}")
+    prof = dict(profiles[name])
+    prof["_name"] = name
+    return prof
+
+
+def save_profile_mm_per_px(prof, ratio):
+    """把本次标定出的 mm/px 写回该型号档案（只有同时给了 --profile 和 --ref-mm 才调）。"""
+    profiles = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    profiles[prof["_name"]]["mm_per_px"] = ratio
+    PROFILE_PATH.write_text(json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 class MeasureError(Exception):
@@ -79,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     """命令行参数。GUI 复用同一套，保证拖照片/标定两种用法参数一致。"""
     p = argparse.ArgumentParser(description="圆环类零件尺寸测量")
     p.add_argument("--image", help="测已有照片；不指定则相机现拍")
+    p.add_argument("--profile", help="零件型号名（见 models/part_profiles.json）；不传则按通用参数检测")
     p.add_argument("--ref-mm", type=float, help="零件外径真值(mm)，用于建立换算系数")
     p.add_argument("--mm-per-px", type=float, help="直接指定 mm/px")
     p.add_argument("--spec-od", type=float, help="外径标称值(mm)，用于 OK/NG")
@@ -105,20 +133,30 @@ def grab_image(args) -> np.ndarray:
     return frame
 
 
-def resolve_ratio(args, outer_dia_px) -> tuple:
-    """确定 mm/px：--mm-per-px 直接用；--ref-mm 用外径真值算并缓存；否则读缓存。"""
+def resolve_ratio(args, outer_dia_px, profile=None) -> tuple:
+    """确定 mm/px。优先级：--mm-per-px > --ref-mm(重建) > 型号档案 > 缓存。
+
+    mm/px 是"相机+镜头+拍摄距离"的函数：不同型号往往要换机位，所以档案里每个型号
+    各存一份，不能跨型号复用（实测型号2 是型号1 的 1.48 倍）。
+    """
     if args.mm_per_px:
         return args.mm_per_px, "命令行指定"
     if args.ref_mm:
         ratio = args.ref_mm / outer_dia_px
         RATIO_CACHE.parent.mkdir(parents=True, exist_ok=True)
         RATIO_CACHE.write_text(json.dumps({"mm_per_pixel": ratio}))
+        if profile:
+            save_profile_mm_per_px(profile, ratio)
+            return ratio, f"本次标定（外径={args.ref_mm}mm），已写回型号档案「{profile['_name']}」"
         return ratio, f"本次标定（外径={args.ref_mm}mm），已缓存到 {RATIO_CACHE}"
+    if profile and profile.get("mm_per_px"):
+        return float(profile["mm_per_px"]), f"型号档案「{profile['_name']}」"
     if RATIO_CACHE.exists():
         return json.loads(RATIO_CACHE.read_text())["mm_per_pixel"], f"缓存 {RATIO_CACHE}"
     raise MeasureError(
         "还没有换算系数，先卡尺量出零件外径，然后运行：\n"
-        "    python src\\measure_ring.py --ref-mm <外径真值mm>"
+        "    python src\\measure_ring.py --ref-mm <外径真值mm>\n"
+        "    （换型号时再加 --profile <型号名>，系数会写回该型号的档案）"
     )
 
 
@@ -127,7 +165,8 @@ def measure(img: np.ndarray, args) -> RingResult:
 
     失败的测量（含贴边等）不一定抛异常，但提示会进 warnings/lines。
     """
-    res = detect(img)
+    profile = load_profile(getattr(args, "profile", None))
+    res = detect(img, profile=profile)
     if res["outer"] is None:
         raise MeasureError("外圈拟合失败。检查：对焦、光照、零件是否在画面中心")
 
@@ -143,7 +182,7 @@ def measure(img: np.ndarray, args) -> RingResult:
     (outer, n_o) = res["outer"]
     (ocx, ocy), (oa1, oa2), oang = outer
     outer_dia_px = (oa1 + oa2) / 2
-    ratio, ratio_src = resolve_ratio(args, outer_dia_px)
+    ratio, ratio_src = resolve_ratio(args, outer_dia_px, profile)
 
     touches_border = (oa1 > img.shape[1] - BORDER_MARGIN * 2 or
                       oa2 > img.shape[0] - BORDER_MARGIN * 2)
@@ -176,11 +215,15 @@ def measure(img: np.ndarray, args) -> RingResult:
         _p(f"        标称 {args.spec_od} ±{args.tol}  偏差 {dev:+.3f}  -> {'OK' if ok else 'NG'}")
 
     # ---- 中心孔 ----
+    no_center_hole = profile is not None and profile.get("has_center_hole") is False
     if res["center_hole"] is None or res["center_hole"][0] is None:
         hole = None
         hole_mm = hole_px = None
-        _p("中心孔: 未检测到（若零件有孔，检查孔内是否反光/遮挡）")
-        warnings.append("中心孔没测到：检查孔内是否反光或被遮挡")
+        if no_center_hole:
+            _p("中心孔: 本型号无中心孔（型号档案 has_center_hole=false），不计入判定")
+        else:
+            _p("中心孔: 未检测到（若零件有孔，检查孔内是否反光/遮挡）")
+            warnings.append("中心孔没测到：检查孔内是否反光或被遮挡")
     else:
         (hole, n_h) = res["center_hole"]
         (hcx, hcy), (ha1, ha2), hang = hole
@@ -219,7 +262,11 @@ def measure(img: np.ndarray, args) -> RingResult:
             bolts_out.append({"idx": i, "mm": b_mm, "px": b["dia"], "ok": b_ok,
                               "status": b["status"], "a1": b["a1"], "a2": b["a2"],
                               "cx": b["cx"], "cy": b["cy"], "ang": b["ang"]})
-        _p("提示: 螺栓孔按沉孔口(norm<0.72 阈值交叉)定义；已用游程宽度过滤+渐缩残差处理暗带/槽缘粘连")
+        if profile is not None and profile.get("feature") == "core_hole":
+            _p("提示: 螺栓孔按紧固件中间的暗芯通孔定义（射线中分界 + 椭圆拟合）；"
+               "位置按型号档案的相对角度定位")
+        else:
+            _p("提示: 螺栓孔按沉孔口(norm<0.72 阈值交叉)定义；已用游程宽度过滤+渐缩残差处理暗带/槽缘粘连")
     else:
         _p("未检测到螺栓孔")
         warnings.append("没检测到螺栓孔")
