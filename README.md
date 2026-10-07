@@ -63,10 +63,15 @@ venv\Scripts\python.exe -c "import cv2, numpy; print(cv2.__version__, numpy.__ve
 所有命令在 `vision-roughness/` 目录下执行：
 
 ```bash
-venv\Scripts\python.exe src\measure_ring.py                        # 相机现拍并测量
-venv\Scripts\python.exe src\measure_ring.py --image data\captures\xxx.jpg
-venv\Scripts\python.exe src\measure_ring.py --ref-mm 88.60          # 用外径真值重建换算系数
+venv\Scripts\python.exe src\measure_ring.py                          # 相机现拍并测量
+venv\Scripts\python.exe src\measure_ring.py --image ..\data\captures\capture_20260908_115557.jpg
+venv\Scripts\python.exe src\measure_ring.py --ref-mm 88.60           # 用外径真值重建换算系数
 ```
+
+> **两个 `data\captures\` 别搞混**：标准验证照片在**仓库根**的 `data\captures\`，
+> 从 `vision-roughness\` 下必须写 `..\data\captures\...`；
+> 而 `vision-roughness\data\captures\` 放的是相机现拍的图（`measure_ring_latest.jpg` 等）。
+> 路径写错会报「无法读取图片」。
 
 | 参数 | 说明 |
 |---|---|
@@ -101,7 +106,7 @@ venv\Scripts\python.exe src\measure_ring.py --ref-mm 88.60          # 用外径�
 
 ## 实测数据（2026-09-14）
 
-输入 `data/captures/capture_20260908_115557.jpg`（12MP，斜视）；
+输入**仓库根**的 `data/captures/capture_20260908_115557.jpg`（12MP，斜视）；
 换算系数 **0.032658 mm/px**（卡尺实测外径 88.60mm 标定，缓存在 `models/mm_per_pixel.json`）。
 
 | 项目 | 像素（椭圆 长×短轴） | mm |
