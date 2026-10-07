@@ -134,18 +134,30 @@ class HikvisionCamera(BaseCamera):
     注意：
         - MV-CU120-10GM 是黑白相机，SDK 输出 Mono8 单通道，capture() 内部
           已转换为 BGR 三通道，下游代码无需改动；
-        - 现场使用建议传入固定的 exposure_us / gain，避免自动曝光导致
-          图像亮度漂移（纹理特征对亮度敏感）。
+        - 曝光默认按现场亮度**自动标定一次再锁定**（见 auto_exposure）：现场光不足时
+          固定曝光会把整帧打成全黑（实测均值 16/255，外圈检测全废），那比"亮度漂移"
+          严重得多。标定完曝光值即固定，同一次开机内读数依然可复现。
+          要严格复现历史读数，传 auto_exposure=False 并用固定 exposure_us。
+
+          （历史注：这里原本写"固定曝光，避免自动曝光导致亮度漂移——纹理特征对亮度
+           敏感"。那条理由属于 commit 7375601 已删除的 EDM 粗糙度纹理分类线；现在
+           只做尺寸测量，靠边缘不靠纹理。见 AGENTS.md §1。）
     """
 
     DEFAULT_SDK_PATH = r"C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport"
 
     def __init__(self, sdk_path: str = None, exposure_us: float = None,
-                 gain: float = None, timeout_ms: int = 3000, packet_size=1500):
+                 gain: float = None, auto_exposure: bool = True,
+                 auto_target: float = 110.0, auto_max_us: float = 200000.0,
+                 timeout_ms: int = 3000, packet_size=1500):
         self._timeout_ms = timeout_ms
         self._packet_size = packet_size
         self._cam = None
         self._grabbing = False
+        self._auto_exposure = auto_exposure
+        self._auto_target = auto_target
+        self._auto_max_us = auto_max_us
+        self.exposure_us = exposure_us          # 最终生效值（自动标定后会更新）
         self._mv = self._import_sdk(sdk_path or self.DEFAULT_SDK_PATH)
         self._open(exposure_us, gain)
 
@@ -204,6 +216,11 @@ class HikvisionCamera(BaseCamera):
             try:
                 self._try_open_one(device_list, i, exposure_us, gain)
                 print(f"[hikvision] 相机{i} 取图验证通过，已就绪")
+                if self._auto_exposure:
+                    try:
+                        self._calibrate_exposure()
+                    except Exception as e:      # 标定失败不该让整个相机判为不可用
+                        print(f"[hikvision] 自动曝光标定失败，沿用当前曝光: {e}")
                 return
             except Exception as e:
                 errors.append(f"  相机{i}({model} @ {ip_str}): {e}")
@@ -213,6 +230,57 @@ class HikvisionCamera(BaseCamera):
             "\n请检查：网线是否插在有相机的网口、相机是否被 MVS 客户端占用、"
             "是否存在 IP 冲突（两台设备同 IP）。"
         )
+
+    def _set_exposure(self, exposure_us: float):
+        """设置曝光时间——只走手动曝光通道，不碰自动曝光节点。"""
+        self._check(self._cam.MV_CC_SetEnumValue("ExposureAuto", 0), "关闭自动曝光")
+        self._check(self._cam.MV_CC_SetFloatValue("ExposureTime", float(exposure_us)),
+                    "设置曝光时间")
+        self.exposure_us = float(exposure_us)
+
+    def _grab_mean(self, settle: int = 2) -> float:
+        """取一帧的平均亮度；先丢 settle 帧，等新曝光值真正生效。
+
+        改完曝光，流里还在传改之前那一帧；不丢帧就会把旧亮度当成新亮度的结果，
+        二分搜索会被带偏。
+        """
+        for _ in range(settle):
+            self.capture()
+        return float(self.capture().mean())
+
+    def _calibrate_exposure(self, iters: int = 6):
+        """按现场亮度自动标定曝光，标定完即锁定（auto_exposure=True 时开机跑一次）。
+
+        现场光不足时固定曝光会把整帧打成全黑（实测均值 16/255），外圈检测全废——
+        这比"亮度漂移"严重得多。标定只跑一次，之后曝光值固定，同一次开机内读数
+        仍可复现。
+
+        按**对数**二分：可用曝光跨度有 3 个数量级（0.2ms~200ms），线性二分在暗端
+        分辨率会低到没用。只用手动曝光通道（ExposureAuto=0 + ExposureTime，两者
+        本机型已验证可用），不依赖 Brightness / AutoExposureTime* / ExposureAuto=Once
+        这些各机型命名不一的节点，免得出错在节点名上反而把相机弄成打不开。
+        """
+        lo, hi = np.log(200.0), np.log(float(self._auto_max_us))
+        target = float(self._auto_target)
+        best = None
+        for _ in range(iters):
+            us = float(np.exp((lo + hi) / 2))
+            self._set_exposure(us)
+            mean = self._grab_mean()
+            if best is None or abs(mean - target) < best[0]:
+                best = (abs(mean - target), us, mean)
+            if mean < target:       # 太暗 -> 加曝光
+                lo = (lo + hi) / 2
+            else:                   # 太亮 -> 减曝光
+                hi = (lo + hi) / 2
+        # 一轮都没接近目标 -> 现场太暗：直接顶到曝光上限，至少把图拍亮，并明确告警。
+        # （判断看在"有没有到过目标亮度"，不看"曝光是否等于上限"——对数二分收敛后
+        #   落在下限附近而不是上限值本身，拿等于上限去判会漏报。）
+        dark = best[2] < target * 0.9
+        chosen = float(self._auto_max_us) if dark else best[1]
+        self._set_exposure(chosen)
+        warn = "  ⚠️ 现场偏暗，已顶到曝光上限，考虑补光" if dark else ""
+        print(f"[hikvision] 自动曝光: {chosen:.0f}us（实测亮度 {best[2]:.1f}，目标 {target:.0f}）{warn}")
 
     def _try_open_one(self, device_list, idx, exposure_us, gain):
         """打开指定枚举项、配置参数、开始采集并试取一帧；失败抛异常并清理。"""
