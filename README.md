@@ -182,7 +182,8 @@ SurfaceIQ/
   系统 Python 缺 cv2：`vision-roughness\venv\Scripts\python.exe`
 - 相机：海康 **MV-CU120-10GM**（12MP 4024×3036，1/1.7" IMX226，黑白，卷帘，GigE，C 口）
   \+ 海康 DH25-10MP-23（25mm FA 定焦）；曝光锁 30000μs、增益 0（锁定亮度）
-- 供电：DC 12V/1A（端子 橙=电源+，灰=电源−）；网线直连电脑，相机 IP 192.168.0.1
+- 供电：DC 12V/1A（端子 橙=电源+，灰=电源−）；网线直连电脑，相机 IP 用 MVS 的
+  IP 配置工具查看/修改（必须与电脑网卡同网段，IP 会随配置变化，别写死在文档里）
 - MVS 装在 `E:\海康sadp\MVS\`（**SDK 路径非默认**，见 `src/config.py`）
 
 ### 踩过的坑
