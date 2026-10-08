@@ -685,7 +685,8 @@ def locate_by_profile_angles(prof, ctx):
         ang = (best_ph + a) % 360
         x, y = from_norm(np.cos(np.deg2rad(ang)) * r_norm,
                          np.sin(np.deg2rad(ang)) * r_norm, ocx, ocy, oa1, oa2, oang)
-        seeds.append({"x": float(x), "y": float(y), "r_exp": r_exp, "src": "profile"})
+        seeds.append({"x": float(x), "y": float(y), "r_exp": r_exp,
+                      "r_norm": r_norm, "src": "profile"})
     return seeds
 
 
@@ -750,7 +751,8 @@ def locate_by_template_ngon(prof, ctx):
             x, y = from_norm(np.cos(np.deg2rad(exp_ang)) * r_norm,
                              np.sin(np.deg2rad(exp_ang)) * r_norm, ocx, ocy, oa1, oa2, oang)
             src = "synthesized"
-        seeds.append({"x": float(x), "y": float(y), "r_exp": None, "src": src})
+        seeds.append({"x": float(x), "y": float(y), "r_exp": None,
+                      "r_norm": float(r_norm), "src": src})
     return seeds
 
 
@@ -778,6 +780,62 @@ def boundary_dark_core(ctx, x, y, r_exp):
     if c is None:
         return None, n
     return c, (dia, dia), 0.0, n
+
+
+# ---- 型号指纹与匹配（自动识别用） ----
+# 指纹只能用**无量纲量**：mm/px 是按型号存的，拿绝对尺寸去认型号会循环依赖。
+# 好在孔数/孔圈比/有无中心孔这些本来就是像素之间的比例，不需要 mm/px 就能算。
+SIG_BOLT_RATIO_TOL = 0.15   # 孔圈半径比容差
+SIG_BORE_RATIO_TOL = 0.15   # 中心孔/外径比容差（档案里没这个字段时不用）
+
+
+def build_signature(hole, seeds, outer):
+    """从一次通用检测的结果里提取型号指纹（全无量纲）。"""
+    (ocx, ocy), (oa1, oa2), _ = outer
+    r_outer = (oa1 + oa2) / 4
+    rs = [s["r_norm"] for s in seeds if s.get("r_norm")]
+    sig = {"bolt_count": len(seeds),
+           "bolt_ratio": float(np.median(rs)) if rs else None,
+           "has_bore": hole is not None,
+           "bore_ratio": None}
+    if hole is not None:
+        (hcx, hcy), (ha1, ha2), _ = hole
+        sig["bore_ratio"] = float((ha1 + ha2) / 4) / r_outer if r_outer else None
+    return sig
+
+
+def match_profile(sig, profiles):
+    """按指纹匹配型号。返回 (型号名 | None, 说明)。
+
+    **只在唯一命中时才认**：命中 0 个 = 未匹配；命中多个也拒绝并列出候选。
+    理由是"认错型号"比"没认出来"危险得多——前者会拿错型号的标称值和 mm/px，
+    给出一个理直气壮的合格判定，而后者只是没有读数。
+    """
+    if not sig or not sig.get("bolt_count"):
+        return None, "没定位到孔，无法识别型号"
+    hits = []
+    for name, prof in profiles.items():
+        if name.startswith("_"):
+            continue
+        bc = prof.get("bolt_count")
+        if bc and int(bc) != int(sig["bolt_count"]):
+            continue
+        hch = prof.get("has_center_hole")
+        if hch is not None and bool(hch) != bool(sig.get("has_bore")):
+            continue
+        pr, sr = prof.get("bolt_circle_ratio"), sig.get("bolt_ratio")
+        if pr and sr and abs(pr - sr) / pr > SIG_BOLT_RATIO_TOL:
+            continue
+        br = prof.get("id_ratio")
+        sb = sig.get("bore_ratio")
+        if br and sb and abs(br - sb) / br > SIG_BORE_RATIO_TOL:
+            continue
+        hits.append(name)
+    if len(hits) == 1:
+        return hits[0], "指纹唯一命中"
+    if not hits:
+        return None, "没有型号的指纹与之相符"
+    return None, "有多个型号都相符（" + "、".join(hits) + "），无法确定"
 
 
 LOCATE_FNS = {
@@ -822,7 +880,8 @@ def detect(img, init_c=None, init_r=None, profile=None):
             break
     if outer is None:
         return {"outer": None, "center_hole": None, "bolts": [],
-                "bolts_locate": None, "bolts_boundary": None, "bolts_unverified": True}
+                "bolts_locate": None, "bolts_boundary": None, "bolts_unverified": True,
+                "signature": None}
     (ocx, ocy), (oa1, oa2), oang = outer
 
     # ---- 中心孔: 外圈内暗->亮的上升沿 ----
@@ -858,7 +917,8 @@ def detect(img, init_c=None, init_r=None, profile=None):
         boundary_name = DEFAULT_BOUNDARY
     bfn = BOUNDARY_FNS[boundary_name]
     bolts = []
-    for s in LOCATE_FNS[locate_name](prof, ctx):
+    seeds = LOCATE_FNS[locate_name](prof, ctx)
+    for s in seeds:
         got = bfn(ctx, s["x"], s["y"], s["r_exp"])
         if got is None or got[0] is None:
             bolts.append({"cx": s["x"], "cy": s["y"], "dia": 0.0, "a1": 0.0, "a2": 0.0,
@@ -870,7 +930,8 @@ def detect(img, init_c=None, init_r=None, profile=None):
                       "src": s["src"], "status": "OK"})
     return {"outer": (outer, n_o), "center_hole": (hole, n_h), "bolts": bolts,
             "bolts_locate": locate_name, "bolts_boundary": boundary_name,
-            "bolts_unverified": unverified}
+            "bolts_unverified": unverified,
+            "signature": build_signature(hole, seeds, outer)}
 
 
 def main(p: Path):

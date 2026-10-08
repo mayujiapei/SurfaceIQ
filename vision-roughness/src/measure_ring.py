@@ -42,10 +42,11 @@ import numpy as np
 sys.path.insert(0, "src")
 import config
 from camera_adapter import create_camera
-from fit_ellipse_ring import detect
+from fit_ellipse_ring import (DEFAULT_BOUNDARY, DEFAULT_LOCATE, detect,
+                              match_profile)
 
 PROFILE_PATH = Path("models/part_profiles.json")
-DEFAULT_PROFILE_KEY = "_默认型号"   # 不传 --profile 时用它（车间入口走这条）
+DEFAULT_PROFILE_KEY = "_默认型号"   # 只在自动识别失败时兜底（报告里会显式写明）
 NO_PROFILE = ("none", "off", "无")  # --profile 显式要求“没有档案”时的取值
 DEBUG_DIR = Path("debug")
 BORDER_MARGIN = 5  # 轮廓距图像边缘小于此值视为“零件超出视野”
@@ -59,33 +60,21 @@ BOUNDARY_HINT = {
 
 
 
-def load_profile(name=None):
-    """读型号档案（models/part_profiles.json）。
-
-    不传 --profile 时用档案里的 `_默认型号`（车间入口走这条，所以日常用法不受影响）。
-    传 "none" 表示明确要求“没有档案”——那会走通用兜底，且结果标为未经验证。
-    返回的 dict 额外带 _name / _default，便于报错和报告里写明用的是哪个型号。
-    """
-    if name and name.lower() in NO_PROFILE:
-        return None
+def load_profiles():
+    """读整份型号档案。识别型号要遍历所有型号，所以整份读进来。"""
     if not PROFILE_PATH.exists():
         raise MeasureError(f"找不到型号档案: {PROFILE_PATH}")
-    profiles = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
-    default = not name
-    if default:
-        name = profiles.get(DEFAULT_PROFILE_KEY)
-        if not name:
-            raise MeasureError(
-                f"{PROFILE_PATH} 里没写 `{DEFAULT_PROFILE_KEY}`，"
-                "且命令行没给 --profile，无法确定测的是哪个型号。")
+    return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+
+
+def named_profile(profiles, name):
+    """按名字取一份档案（命令行显式指定型号时用）。"""
     if name not in profiles:
         have = "、".join(k for k in profiles if not k.startswith("_"))
         raise MeasureError(f"型号档案里没有「{name}」。现有型号：{have}")
     prof = dict(profiles[name])
     prof["_name"] = name
-    prof["_default"] = default
     return prof
-
 
 
 def save_profile_mm_per_px(prof, ratio):
@@ -131,6 +120,7 @@ class RingResult:
     boundary: Optional[str] = None
     unverified: bool = False                       # 是否走了兜底（缺档案）
     center_hole_expected: bool = True              # 本型号是否本该有中心孔（"没有"≠"没测到"）
+    identified: str = ""                           # 型号是怎么定下来的（自动识别/命令行指定）
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -182,7 +172,7 @@ def resolve_ratio(args, outer_dia_px, profile=None):
     if args.ref_mm:
         # 必须显式 --profile：标定是型号相关的重动作，绝不能因为“某个型号恰好是默认型号”
         # 就写进那个型号的档案里（--ref-mm 单独跑过去会把默认型号的系数悄悄改掉）。
-        if not profile or profile.get("_default"):
+        if not profile or not profile.get("_explicit"):
             raise MeasureError(
                 "用 --ref-mm 标定必须**显式**指明型号：\n"
                 "    python src\measure_ring.py --profile <型号名> --ref-mm <外径真值mm>\n"
@@ -225,8 +215,42 @@ def measure(img: np.ndarray, args) -> RingResult:
 
     失败的测量（含贴边等）不一定抛异常，但提示会进 warnings/lines。
     """
-    profile = load_profile(getattr(args, "profile", None))
-    res = detect(img, profile=profile)
+    profiles = load_profiles()
+    explicit = getattr(args, "profile", None)
+    profile, ident, res = None, "", None
+    fallback_used = False
+    if explicit and explicit.lower() in NO_PROFILE:
+        ident = "命令行要求按「无档案」处理：通用试测，结果未验证"
+    elif explicit:
+        profile = named_profile(profiles, explicit)
+        profile["_explicit"] = True          # 只有显式指定的型号才允许 --ref-mm 写回
+        ident = f"命令行指定型号「{profile['_name']}」"
+    else:
+        # **自动识别**：先通用跑一遍拿指纹——这一步不需要任何档案。
+        # 指纹只用无量纲量（孔数/孔圈比/有无中心孔），所以不依赖 mm/px。
+        res = detect(img)
+        if res["outer"] is None:
+            raise MeasureError(locate_fail_hint(img))
+        name, why = match_profile(res["signature"], profiles)
+        fallback = profiles.get(DEFAULT_PROFILE_KEY)
+        if name is None and fallback and fallback in profiles:
+            # 识别失败 -> 按显式配置的默认型号测，**并在报告里说清是兜底、请人工确认**。
+            # 这是最后一道保底，不是"猜一个型号"：默认型号是配置里写明的那个。
+            profile = named_profile(profiles, fallback)
+            ident = (f"自动识别失败（{why}）→ 按默认型号「{fallback}」测量，**请人工确认零件型号**")
+            fallback_used = True
+            res = None
+        elif name is None:
+            ident = f"自动识别失败：{why}；已按通用方式试测，结果未验证"
+        else:
+            profile = named_profile(profiles, name)
+            ident = f"自动识别型号「{name}」（{why}）"
+            # 识别出的型号若正好走通用策略，就复用这一遍，不白跑第二次
+            if not ((profile.get("locate") or DEFAULT_LOCATE) == DEFAULT_LOCATE
+                    and (profile.get("boundary") or DEFAULT_BOUNDARY) == DEFAULT_BOUNDARY):
+                res = None
+    if res is None:
+        res = detect(img, profile=profile)
     if res["outer"] is None:
         raise MeasureError(locate_fail_hint(img))
 
@@ -262,13 +286,15 @@ def measure(img: np.ndarray, args) -> RingResult:
     od_mm = None if ratio is None else outer_dia_px * ratio
     _p("\n===== 测量报告 =====")
     _p(f"时间: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}    图像: {src_desc}")
-    if profile is not None:
-        mark = "（默认型号）" if profile.get("_default") else ""
-        _p(f"型号: {profile['_name']}{mark}    定位={loc} 边界={bnd}")
-    else:
-        _p(f"型号: 未指定（无档案）    兜底 定位={loc} 边界={bnd}")
-        _p("⚠️  没有型号档案：按通用方式试测，结果**未经验证**（没有标称值可核对）")
-        warnings.append("没给型号档案，螺栓孔为通用试测结果，未经验证")
+    _p(f"型号: {profile['_name'] if profile else '未确定（无档案）'}    {ident}")
+    _p(f"      定位={loc} 边界={bnd}")
+    if fallback_used:
+        _p("⚠️  **没能自动识别出型号**，上面的读数是按默认型号测的——请人工确认零件型号对不对；")
+        _p("    如果不对，说明该零件还没建档，或它和默认型号的指纹太接近。")
+        warnings.append("没能自动识别型号，已按默认型号测量，请人工确认零件型号")
+    if unverified:
+        _p("⚠️  型号未识别/未指定：按通用方式试测，结果**未经验证**（没有标称值可核对）")
+        warnings.append("型号未识别或未指定，结果未经验证")
     if ratio is None:
         _p(f"换算系数: 无 —— {ratio_src}")
         _p("        没有本型号的系数就**只报像素、不给毫米**"
@@ -389,7 +415,7 @@ def measure(img: np.ndarray, args) -> RingResult:
         lines=lines, debug_jpg=dbg_path, report_txt=rep_path, debug_img=dbg,
         profile_name=(profile["_name"] if profile else None),
         locate=loc, boundary=bnd, unverified=unverified,
-        center_hole_expected=not no_center_hole,
+        center_hole_expected=not no_center_hole, identified=ident,
     )
 
 
