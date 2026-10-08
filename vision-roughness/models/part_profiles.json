@@ -1,7 +1,8 @@
 {
   "_说明": [
-    "零件型号档案。所有型号平级：检测由 locate(怎么定位孔) + boundary(量哪条边界) 两个维度决定，",
-    "不再有“某个型号是代码里的默认样式”这回事。不传 --profile 时用 _默认型号（车间入口走这条）。",
+    "零件型号档案。所有型号平级：检测由 locate(怎么定位孔) + boundary(量哪条边界) 两个维度决定。",
+    "不传 --profile 时用**极坐标指纹**自动识别型号（models/fingerprints/<型号名>.npz）；",
+    "识别不出来就**不猜**：本次只给像素、标未验证，并提示人工选型号（界面下拉框 / --profile）。",
     "od_mm     外径卡尺真值，同时是本型号 mm_per_px 的标定依据。",
     "bolt_mm   特征的标称值（boundary 决定它指的是哪条边界）。null=还没量，不判 OK/NG。",
     "bolt_count 孔数；template_ngon 定位拿它当等分数，缺省则由数据推断。",
@@ -9,10 +10,9 @@
     "locate    profile_angles(按角度+相位搜索) | template_ngon(暗斑模板匹配 + n 等分校验)",
     "boundary  countersink_rim(沉孔口阈值交叉) | dark_core(暗芯中分界)",
     "mm_per_px 本型号的换算系数，每个型号各一份——尺度跟机位走，不能跨型号复用。",
-    "_默认型号：**只在自动识别失败时兜底**，并会在报告里显式写出\"识别失败、按默认型号测量、请人工确认\"。",
-    "识别本身的正确路径是自动匹配（孔数/有无中心孔/孔圈比这些无量纲指纹），默认型号只是最后一道保底。"
+    "fingerprint_src 该型号指纹的参考图。**参考图不入库**（data/captures/ 已被 .gitignore），",
+    "  指纹是唯一凭据；换参考图/换机位/换光照/换镜头必须用 --save-fingerprint 重新生成。"
   ],
-  "_默认型号": "型号1-6孔圆环",
   "型号1-6孔圆环": {
     "od_mm": 88.6,
     "id_mm": null,
@@ -24,6 +24,7 @@
     "bolt_angles_rel": null,
     "bolt_circle_ratio": 0.78,
     "mm_per_px": 0.03265837402143378,
+    "fingerprint_src": "../data/captures/capture_20260908_115557.jpg",
     "_备注": [
       "od_mm 是当初 --ref-mm 用过的卡尺真值；中心孔/螺栓孔标称值用户还没给，留 null。",
       "螺栓孔测的是沉孔口口径（含沉孔锥度），不是螺纹孔径；读数分散 ±7%，不得据此判超差。"
@@ -45,6 +46,7 @@
     ],
     "bolt_circle_ratio": 0.818,
     "mm_per_px": 0.04836640294230451,
+    "fingerprint_src": "data/captures/capture_single_20261007_203729.jpg",
     "_备注": [
       "无中心孔（实心盘）：has_center_hole=false，检测不走中心孔那一段。",
       "这 4 个“孔”是装好的紧固件（暗芯 + 亮环 + 两片亮叶片），bolt_mm=1.78 指中间暗芯通孔；",

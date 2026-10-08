@@ -782,60 +782,149 @@ def boundary_dark_core(ctx, x, y, r_exp):
     return c, (dia, dia), 0.0, n
 
 
-# ---- 型号指纹与匹配（自动识别用） ----
-# 指纹只能用**无量纲量**：mm/px 是按型号存的，拿绝对尺寸去认型号会循环依赖。
-# 好在孔数/孔圈比/有无中心孔这些本来就是像素之间的比例，不需要 mm/px 就能算。
-SIG_BOLT_RATIO_TOL = 0.15   # 孔圈半径比容差
-SIG_BORE_RATIO_TOL = 0.15   # 中心孔/外径比容差（档案里没这个字段时不用）
+# ======================================================================
+# 型号识别：外圈环带的**极坐标指纹**
+#
+# 为什么不是"找孔、数孔、比孔圈比"（那套 `build_signature`/`match_profile` 已删除）：
+# 那条路要求暗斑面积 ≥3000px²（等效直径 ≥61.8px，**绝对像素门槛**），型号2 的暗芯
+# 只有 ~37px，在第一关就被挡掉，孔数=0；型号1 那边孔数推断又被盘面假峰带偏。
+# 实测命中率 0。用绝对像素尺寸做判据这条路不要再走。
+#
+# 指纹为什么能成立：绝对尺寸不能用来认型号（mm/px 是按型号存的，拿绝对外径查档案
+# 是循环依赖），但**归一化后的外圈环带**可以——按归一化半径展开、整体标准化，
+# 尺度/亮度/对比度就都不影响匹配；沿角度做循环互相关，旋转不变性也是免费的。
+# 全程只依赖一个几何量：外圈椭圆。
+FP_N_ANG = 720          # 行 = 图像极角，0.5°/行，首尾相接（循环互相关要求它闭合）
+FP_N_RAD = 48           # 列 = 从外缘往内的归一化深度
+FP_DEPTH = 0.85         # 展开到"外缘往内 0.85×r_ell(θ)"
+FP_ANCHOR_LO = 0.90     # 找外缘的窗口（× r_ell(θ)）
+FP_ANCHOR_HI = 1.12
+FP_ANCHOR_STEP = 0.0025  # 窗口内采样步长（归一化半径，≈3px）
+FP_SIGMA_RAD = 3.0      # 沿半径方向的平滑（列数）
+FP_HARMONICS = 4        # 锚点曲线保留的谐波阶数（椭圆是纯 2 次谐波）
+FP_ACCEPT = 0.30        # 认型号所需的最低相关系数
+FP_GAP = 0.15           # 与次高分的最小差距（多个型号都像就拒绝）
+# ⚠️ 上面两个门槛是**暂定值**：目前只有 2 个零件标定（型号1/型号2 各一张参考图），
+# 值是从"自匹配 vs 交叉匹配"的实测分布上取的（自匹配最差 0.463、交叉最高 0.078）。
+# **拿到第三个零件后必须复核**，别当通用常数。更不许为了让某张图认得出来去调它。
 
 
-def build_signature(hole, seeds, outer):
-    """从一次通用检测的结果里提取型号指纹（全无量纲）。"""
-    (ocx, ocy), (oa1, oa2), _ = outer
-    r_outer = (oa1 + oa2) / 4
-    rs = [s["r_norm"] for s in seeds if s.get("r_norm")]
-    sig = {"bolt_count": len(seeds),
-           "bolt_ratio": float(np.median(rs)) if rs else None,
-           "has_bore": hole is not None,
-           "bore_ratio": None}
-    if hole is not None:
-        (hcx, hcy), (ha1, ha2), _ = hole
-        sig["bore_ratio"] = float((ha1 + ha2) / 4) / r_outer if r_outer else None
-    return sig
+def _ell_radius(th, a1, a2, ang):
+    """图像极角 th 方向上外圈椭圆的半径（与 polar_resid 里的闭式解同一套）。"""
+    ca, sa = np.cos(np.deg2rad(-ang)), np.sin(np.deg2rad(-ang))
+    c, s = np.cos(th), np.sin(th)
+    xr = c * ca + s * sa
+    yr = -c * sa + s * ca
+    return 1.0 / np.sqrt((xr / (a1 / 2)) ** 2 + (yr / (a2 / 2)) ** 2)
 
 
-def match_profile(sig, profiles):
-    """按指纹匹配型号。返回 (型号名 | None, 说明)。
+def _smooth_anchor(u, th):
+    """把逐射线的锚点曲线做低阶傅里叶拟合，返回平滑后的曲线。
 
-    **只在唯一命中时才认**：命中 0 个 = 未匹配；命中多个也拒绝并列出候选。
-    理由是"认错型号"比"没认出来"危险得多——前者会拿错型号的标称值和 mm/px，
-    给出一个理直气壮的合格判定，而后者只是没有读数。
+    为什么要平滑：外缘是一条**有厚度**的带（零件外缘有倒角/圆角，斜视下还一段亮
+    一段暗），逐射线取"最强梯度"会在带的两侧之间来回跳（实测抖动 std≈0.042×r_ell）。
+    椭圆的极坐标半径本身是 θ 的**纯二次谐波**函数，所以用谐波 0/2/4 拟合既滤掉抖动、
+    又保留真实的（轻微非椭圆）偏差。这一步是旋转不变性能用的关键：不平滑时自匹配在
+    47°~317° 会掉到 0.15，与交叉得分重叠、根本分不开。
     """
-    if not sig or not sig.get("bolt_count"):
-        return None, "没定位到孔，无法识别型号"
-    hits = []
-    for name, prof in profiles.items():
-        if name.startswith("_"):
+    cols = [np.ones_like(th)]
+    for k in range(1, FP_HARMONICS // 2 + 1):
+        cols += [np.cos(2 * k * th), np.sin(2 * k * th)]
+    A = np.stack(cols, axis=1)
+    coef, *_ = np.linalg.lstsq(A, u, rcond=None)
+    return A @ coef
+
+
+def _outer_edge_anchor(norm, outer):
+    """每条射线各自量自己的外缘，返回 (归一化锚点深度, r_ell, th)。
+
+    锚点在**拟合椭圆**周围的窄窗口里找，所以不依赖"零件在哪"的先验；而"每条射线各
+    锚各的"正好抵消掉全局的半径/圆心误差——拟合椭圆会随零件转动在带内漂（实测型号1
+    转 47° 时外径 2712.9→2780.3px，+2.5%），拿它当径向基准会把指纹整体错开约 9 列，
+    自匹配因此掉到 0.15。逐射线锚定把这类误差按角度各自消掉。
+    """
+    (ocx, ocy), (oa1, oa2), oang = outer
+    th = np.arange(FP_N_ANG) * (2 * np.pi / FP_N_ANG)
+    r_ell = _ell_radius(th, oa1, oa2, oang)
+    rho = np.arange(FP_ANCHOR_LO, FP_ANCHOR_HI, FP_ANCHOR_STEP)
+    xs = (ocx + np.cos(th)[:, None] * (r_ell[:, None] * rho[None, :])).astype(np.float32)
+    ys = (ocy + np.sin(th)[:, None] * (r_ell[:, None] * rho[None, :])).astype(np.float32)
+    prof = cv2.remap(norm.astype(np.float32), xs, ys, cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REPLICATE)
+    g = np.gradient(prof, axis=1)
+    k = np.arange(FP_N_ANG)
+    j = np.clip(np.argmax(np.abs(g), axis=1), 1, g.shape[1] - 2)
+    a, b, c = g[k, j - 1], g[k, j], g[k, j + 1]   # 抛物线插值取亚像素极值
+    den = a - 2 * b + c
+    delta = np.where(den != 0, 0.5 * (a - c) / np.where(den == 0, 1.0, den), 0.0)
+    u = FP_ANCHOR_LO + (j + np.clip(delta, -1.0, 1.0)) * FP_ANCHOR_STEP
+    return _smooth_anchor(u, th), r_ell, th
+
+
+def polar_fingerprint(gray, outer):
+    """外圈环带 -> (FP_N_ANG, FP_N_RAD) 标准化极坐标指纹。
+
+    灰度先做局部对比度归一化（gray / blur(gray,201)，与螺栓孔那段同一配方），再把整张
+    指纹标准化；径向用"从实测外缘往内的归一化深度"，横向是该角度的 r_ell(θ)（倾斜由它
+    承担）。所以亮度/对比度/尺度/旋转都不影响匹配——全程无量纲，不需要 mm/px。
+    """
+    (ocx, ocy), _, _ = outer
+    sm = cv2.GaussianBlur(gray, (0, 0), 5)
+    norm = sm / np.maximum(cv2.blur(sm, (201, 201)), 1)
+    u_anchor, r_ell, th = _outer_edge_anchor(norm, outer)
+    u = np.linspace(0.0, FP_DEPTH, FP_N_RAD)
+    r = (u_anchor[:, None] - u[None, :]) * r_ell[:, None]
+    xs = (ocx + np.cos(th)[:, None] * r).astype(np.float32)
+    ys = (ocy + np.sin(th)[:, None] * r).astype(np.float32)
+    fp = cv2.remap(norm.astype(np.float32), xs, ys, cv2.INTER_LINEAR,
+                   borderMode=cv2.BORDER_REPLICATE)
+    fp = cv2.GaussianBlur(fp, (0, 0), sigmaX=FP_SIGMA_RAD, sigmaY=0.15)
+    fp = fp - fp.mean()
+    return (fp / (fp.std() + 1e-9)).astype(np.float32)
+
+
+def match_fingerprint(fp, fingerprints):
+    """待测指纹 vs 各型号指纹，返回 (型号名 | None, 说明)。
+
+    沿角度做**循环互相关**：圆环展开天然周期，两图又都已标准化，而循环移位不改变
+    均值/标准差，所以互相关的峰值就是皮尔逊相关系数——一次 FFT 就把 720 个移位全算完。
+    得分**取符号值、不取绝对值**：亮暗反转的零件不该被认成同一个。
+
+    **只在明确命中时才认**，而且保守到底：
+      - 最高分 < FP_ACCEPT     -> 未识别（说明最像的是谁、差多少）；
+      - 与次高分差距 < FP_GAP  -> 多个型号都像，拒绝并列出候选。
+    理由是"认错型号"比"没认出来"危险得多——前者会拿错型号的标称值和 mm/px，给一个
+    理直气壮的错读数。
+    """
+    if fp is None:
+        return None, "没能算出待测图的指纹"
+    if not fingerprints:
+        return None, "没有任何型号的指纹可比对（先用 --save-fingerprint 建档）"
+    f1 = fp - fp.mean()
+    f1 = f1 / (f1.std() + 1e-9)
+    f1f = np.fft.fft(f1, axis=0)
+    scores = {}
+    for name, ref in fingerprints.items():
+        if ref is None or np.shape(ref) != np.shape(fp):
             continue
-        bc = prof.get("bolt_count")
-        if bc and int(bc) != int(sig["bolt_count"]):
-            continue
-        hch = prof.get("has_center_hole")
-        if hch is not None and bool(hch) != bool(sig.get("has_bore")):
-            continue
-        pr, sr = prof.get("bolt_circle_ratio"), sig.get("bolt_ratio")
-        if pr and sr and abs(pr - sr) / pr > SIG_BOLT_RATIO_TOL:
-            continue
-        br = prof.get("id_ratio")
-        sb = sig.get("bore_ratio")
-        if br and sb and abs(br - sb) / br > SIG_BORE_RATIO_TOL:
-            continue
-        hits.append(name)
-    if len(hits) == 1:
-        return hits[0], "指纹唯一命中"
-    if not hits:
-        return None, "没有型号的指纹与之相符"
-    return None, "有多个型号都相符（" + "、".join(hits) + "），无法确定"
+        f2 = ref - ref.mean()
+        f2 = f2 / (f2.std() + 1e-9)
+        c = np.fft.ifft(f1f * np.conj(np.fft.fft(f2, axis=0)), axis=0).real
+        scores[name] = float(c.sum(axis=1).max() / f1.size)
+    if not scores:
+        return None, "没有可用的指纹（尺寸对不上，可能是用旧参数生成的）"
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    best, best_s = ranked[0]
+    if best_s < FP_ACCEPT:
+        return None, (f"最高相关只有 {best_s:.3f}（最像的是「{best}」），"
+                      f"低于门槛 {FP_ACCEPT:.2f}")
+    if len(ranked) > 1:
+        second, second_s = ranked[1]
+        if best_s - second_s < FP_GAP:
+            return None, (f"「{best}」({best_s:.3f}) 与「{second}」({second_s:.3f}) "
+                          f"太接近（差距 {best_s - second_s:.3f} < {FP_GAP:.2f}）")
+        return best, f"极坐标指纹匹配 相关 {best_s:.3f}（次高「{second}」{second_s:.3f}）"
+    return best, f"极坐标指纹匹配 相关 {best_s:.3f}（档案里只有这一个指纹）"
 
 
 LOCATE_FNS = {
@@ -847,6 +936,26 @@ BOUNDARY_FNS = {
     "countersink_rim": boundary_countersink_rim,
     "dark_core": boundary_dark_core,
 }
+
+
+def find_outer(gray, init_c=None, init_r=None):
+    """外圈自适应定位，返回 ((椭圆, 保留点数) 或 None, σ=5 的模糊图)。
+
+    单独拿出来是因为**型号识别也要外圈椭圆**（极坐标指纹的径向基准就是它），而识别
+    跑在检测之前——若复用 detect()，会把整条螺栓孔管线白跑一遍。
+    """
+    h, w = gray.shape
+    sm = cv2.GaussianBlur(gray, (0, 0), 5)
+    # 旧先验优先(保基线)，不行再自适应定位
+    cx0, cy0 = init_c or (w / 2, h / 2)
+    for (cx, cy, r0, pol) in _outer_candidates(gray, w, h, cx0, cy0, init_r):
+        ell, n = _fit_outer_at(sm, cx, cy, r0, pol)
+        if ell is None:
+            continue
+        ell, n = _refine_outer(sm, ell, n, pol)
+        if _outer_ok(ell, n, w, h):
+            return (ell, n), sm
+    return None, sm
 
 
 def detect(img, init_c=None, init_r=None, profile=None):
@@ -865,23 +974,13 @@ def detect(img, init_c=None, init_r=None, profile=None):
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
-    sm = cv2.GaussianBlur(gray, (0, 0), 5)
 
     # ---- 外圈: 旧先验优先(保基线)，不行再自适应定位 ----
-    cx0, cy0 = init_c or (w / 2, h / 2)
-    outer = n_o = None
-    for (cx, cy, r0, pol) in _outer_candidates(gray, w, h, cx0, cy0, init_r):
-        ell, n = _fit_outer_at(sm, cx, cy, r0, pol)
-        if ell is None:
-            continue
-        ell, n = _refine_outer(sm, ell, n, pol)
-        if _outer_ok(ell, n, w, h):
-            outer, n_o = ell, n
-            break
-    if outer is None:
+    found, sm = find_outer(gray, init_c, init_r)
+    if found is None:
         return {"outer": None, "center_hole": None, "bolts": [],
-                "bolts_locate": None, "bolts_boundary": None, "bolts_unverified": True,
-                "signature": None}
+                "bolts_locate": None, "bolts_boundary": None, "bolts_unverified": True}
+    outer, n_o = found
     (ocx, ocy), (oa1, oa2), oang = outer
 
     # ---- 中心孔: 外圈内暗->亮的上升沿 ----
@@ -930,8 +1029,7 @@ def detect(img, init_c=None, init_r=None, profile=None):
                       "src": s["src"], "status": "OK"})
     return {"outer": (outer, n_o), "center_hole": (hole, n_h), "bolts": bolts,
             "bolts_locate": locate_name, "bolts_boundary": boundary_name,
-            "bolts_unverified": unverified,
-            "signature": build_signature(hole, seeds, outer)}
+            "bolts_unverified": unverified}
 
 
 def main(p: Path):
