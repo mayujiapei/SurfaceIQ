@@ -69,7 +69,7 @@ venv\Scripts\python.exe -c "import cv2, numpy; print(cv2.__version__, numpy.__ve
 ```bash
 venv\Scripts\python.exe src\measure_ring.py                          # 相机现拍并测量
 venv\Scripts\python.exe src\measure_ring.py --image ..\data\captures\capture_20260908_115557.jpg
-venv\Scripts\python.exe src\measure_ring.py --ref-mm 88.60           # 用外径真值重建换算系数
+venv\Scripts\python.exe src\measure_ring.py --profile 型号1-6孔圆环 --ref-mm 88.60   # 标定该型号
 venv\Scripts\python.exe src\measure_ring.py --image xxx.jpg --profile 型号2-4孔圆盘   # 按型号档案测
 ```
 
@@ -82,7 +82,7 @@ venv\Scripts\python.exe src\measure_ring.py --image xxx.jpg --profile 型号2-4�
 |---|---|
 | `--image <路径>` | 测已有照片；不指定则相机现拍 |
 | `--profile <型号名>` | 按 `models/part_profiles.json` 里的型号档案测（见下节）|
-| `--ref-mm <mm>` | 零件**外径真值**，用于建立 mm/px 换算系数并缓存 |
+| `--ref-mm <mm>` | 零件**外径真值**，用于标定该型号的 mm/px（**必须带 `--profile`**，会写回档案）|
 | `--mm-per-px <系数>` | 直接指定换算系数，绕过标定 |
 | `--spec-od / --spec-id / --spec-bolt <mm>` | 外径 / 中心孔 / 螺栓孔**标称值**，用于 OK/NG |
 | `--tol <mm>` | 公差 ±mm，默认 `0.1` |
@@ -104,13 +104,19 @@ venv\Scripts\python.exe src\measure_ring.py --image xxx.jpg --profile 型号2-4�
 | `bolt_mm` / `bolt_count` | 螺栓孔标称值；孔数 |
 | `bolt_angles_rel` | 各孔**相对**第 1 个孔的角度偏移（支持非等分布局）|
 | `bolt_circle_ratio` | 孔心圆半径 ÷ 外圈半径 |
-| `feature` | `countersink`=暗沉孔口那类；`core_hole`=装好紧固件的暗芯孔那类 |
+| `locate` | **怎么定位孔**：`profile_angles`=按档案角度+相位搜索；`template_ngon`=暗斑模板匹配+n等分校验 |
+| `boundary` | **量哪条边界**：`countersink_rim`=沉孔口阈值交叉；`dark_core`=暗芯中分界 |
 | `mm_per_px` | 本型号的换算系数（**每个型号各一份**，尺度跟着机位走，不能跨型号复用）|
 
-**新做一款零件**：加一条档案 → 卡尺量外径 → `--profile <型号名> --ref-mm <外径>` 标定一次
-（系数会**写回档案**）→ 之后该型号直接 `--profile <型号名>` 就能测。
+**新做一款零件**：加一条档案（填尺寸 + 选 `locate`/`boundary`）→ 卡尺量外径 →
+`--profile <型号名> --ref-mm <外径>` 标定一次（系数会**写回档案**）→
+之后该型号直接 `--profile <型号名>` 就能测。
 
-> 不传 `--profile` 时行为与以前完全一致，老用法不受影响。
+> **不传 `--profile` 时用档案里的「_默认型号」**（车间日常入口走这条，行为与以前一致）。
+> 传 `--profile none` 则明确按「无档案」处理：走通用兜底、结果标「未经验证」、
+> **只给像素不给毫米**——因为没有本型号的系数时，拿别的型号的系数印数就是错的。
+>
+> `--ref-mm` **必须显式带 `--profile`**：否则会落到默认型号、把它的系数悄悄改掉。
 
 ---
 
@@ -125,8 +131,9 @@ venv\Scripts\python.exe src\measure_ring.py --image xxx.jpg --profile 型号2-4�
    所以零件偏出画面中心、换机位改变成像大小、或者零件比背景亮（上升沿）都能测到；
    老先验排在候选首位，所以原来能测的图读数逐位不变。
 2. **中心孔** —— 同一套射线法找暗→亮的上升沿。
-3. **螺栓孔** —— 按型号档案的 `feature` 分两条路：
-   - `countersink`（暗沉孔口那类）走下面三步：
+3. **螺栓孔** —— 由型号档案的 `locate`(怎么定位) + `boundary`(量哪条边界) 两个维度派发，
+   **所有型号平级**；新增形态是加一个策略函数，不是加一条 if 分支。
+   `template_ngon` 定位 + `countersink_rim` 边界（暗沉孔口那类）走下面三步：
    - 粗暗斑挖 250×250 模板 → 1/3 缩比模板匹配（`TM_CCOEFF_NORMED`）取峰；
    - **六孔等角共圆校验**：转到外圈椭圆归一化坐标系，用 RANSAC 思路选相位锚，
      生成 6 个 60° 等角槽位 —— 同时完成「滤假峰」和「补缺失孔」；
@@ -144,7 +151,7 @@ venv\Scripts\python.exe src\measure_ring.py --image xxx.jpg --profile 型号2-4�
 ## 实测数据（2026-09-14）
 
 输入**仓库根**的 `data/captures/capture_20260908_115557.jpg`（12MP，斜视）；
-换算系数 **0.032658 mm/px**（卡尺实测外径 88.60mm 标定，缓存在 `models/mm_per_pixel.json`）。
+换算系数 **0.032658 mm/px**（卡尺实测外径 88.60mm 标定，存在型号档案「型号1-6孔圆环」里）。
 
 | 项目 | 像素（椭圆 长×短轴） | mm |
 |---|---|---|
@@ -202,7 +209,6 @@ SurfaceIQ/
 │   │   ├── capture_single.py    单张采图（无窗口，连拍不覆盖）
 │   │   └── explore_ring.py / profile_ring.py / ray_ring.py / edge_ring.py
 │   │                            开发期图像诊断工具（见文末）
-│   ├── models/mm_per_pixel.json mm/px 换算系数缓存（换机位要重建）
 │   ├── models/part_profiles.json 型号档案（标称值 / 孔数 / 孔位角度 / 各型号 mm/px）
 │   ├── debug/                   每次测量的调试图 + 文字报告 + GUI 日志（未入库）
 │   ├── data/captures/           采集的图片（未入库）
@@ -256,13 +262,14 @@ SurfaceIQ/
 ## 换相机 / 重新标定
 
 1. 改 `src/config.py` 的 `CAMERA_TYPE` / `CAMERA_KWARGS`（业务代码零改动）；
-2. 卡尺量出零件外径真值，重建 mm/px 换算系数：
+2. 卡尺量出零件外径真值，重新标定**该型号**的 mm/px 换算系数（系数只存在型号档案里，
+   每个型号各一份）：
 
    ```bash
-   venv\Scripts\python.exe src\measure_ring.py --ref-mm <外径真值mm>
+   venv\Scripts\python.exe src\measure_ring.py --profile <型号名> --ref-mm <外径真值mm>
    ```
 
-3. 换算系数跟着「相机 + 镜头 + 拍摄距离」走，**三者任一变化都必须重建**。
+3. 换算系数跟着「相机 + 镜头 + 拍摄距离」走，**三者任一变化都必须对该型号重新标定**。
 
 ---
 

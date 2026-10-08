@@ -552,18 +552,30 @@ class MeasureWindow:
         else:
             self._set_status("已测量", COLOR_BUSY)
 
-        self.lbl_od.config(text=f"{r.outer_mm:.3f}", fg=COLOR_TEXT)
-        if r.center_hole_mm is None:
+        # 没有本型号的换算系数时只显示像素：带 (px) 后缀 + 弱化颜色，不会被当成毫米读
+        if r.outer_mm is None:
+            self.lbl_od.config(text=f"{r.outer_px:.0f}(px)", fg=COLOR_MUTED)
+        else:
+            self.lbl_od.config(text=f"{r.outer_mm:.3f}", fg=COLOR_TEXT)
+        if not r.center_hole_expected:
+            self.lbl_id.config(text="无此孔", fg=COLOR_MUTED)   # 本型号本来就没有，不是"没测到"
+        elif r.center_hole_px is None:
             self.lbl_id.config(text="未测到", fg=COLOR_NG)
+        elif r.center_hole_mm is None:
+            self.lbl_id.config(text=f"{r.center_hole_px:.0f}(px)", fg=COLOR_MUTED)
         else:
             self.lbl_id.config(text=f"{r.center_hole_mm:.3f}", fg=COLOR_TEXT)
 
         for i, lbl in enumerate(self.bolt_labels):
             b = r.bolts[i] if i < len(r.bolts) else None
-            if b is None or b.get("mm") is None:
+            if b is None or (b.get("mm") is None and b.get("px") is None):
                 lbl.config(text=f"{CIRCLED[i]}—", fg=COLOR_MUTED)
+            elif b.get("mm") is None:
+                lbl.config(text=f"{CIRCLED[i]}{b['px']:.0f}px", fg=COLOR_MUTED)
             else:
-                lbl.config(text=f"{CIRCLED[i]}{b['mm']:.3f}",
+                # 位置推定的孔加个 ? —— 它的位置是按等角假设推的，不是实测到的峰
+                mark = "?" if b.get("src") == "synthesized" else ""
+                lbl.config(text=f"{CIRCLED[i]}{b['mm']:.3f}{mark}",
                            fg=COLOR_NG if b.get("ok") is False else COLOR_TEXT)
 
         if r.warnings:
@@ -578,8 +590,13 @@ class MeasureWindow:
         self.btn_again.config(state="normal")
         self._sync_pause_button()
         self._measuring = False
+        prof = (f"型号: {r.profile_name}" if r.profile_name else "型号: 未指定（无档案）")
+        if r.unverified:
+            prof += "·未验证"
+        coef = (f"换算系数: {r.ratio:.6f} mm/px（{r.ratio_src}）" if r.ratio is not None
+                else f"换算系数: 无（{r.ratio_src}）")
         self.lbl_foot.config(
-            text=f"图像: {r.src_desc}    换算系数: {r.ratio:.6f} mm/px（{r.ratio_src}）"
+            text=f"图像: {r.src_desc}    {prof}    {coef}"
                  f"    帧率: {self.src.fps:.1f} fps\n报告: {r.report_txt}")
 
     def _render_error(self, exc):

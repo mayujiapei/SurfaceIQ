@@ -166,13 +166,20 @@ def template_locate(sm, template, expect=12, scale=3):
     return peaks
 
 
-def hexagon_slots(cands, ocx, ocy, oa1, oa2, oang, tol_ang=13, tol_r=0.15):
-    """RANSAC 六边形假设检验: 以命中数最高的候选为相位锚, 生成 6 个等角槽位。
+def ngon_slots(cands, ocx, ocy, oa1, oa2, oang, n=6, tol_ang=13, tol_r=0.15):
+    """n 等分假设检验: 以命中数最高的候选为相位锚, 生成 n 个等角槽位。
 
-    返回 [(期望角, 归一化半径, 峰orNone)]。
+    返回 [(期望角, 归一化半径, 峰orNone)]。**峰为 None 表示这个槽位是"位置推定"的**，
+    调用方必须把它标出来，不能让推定位置的结果看起来跟实测的一样。
+
+    原来写死 6 孔 60°（`hexagon_slots`）。实测那份合成数据说明写死会怎么坏：
+    12 孔零件下 6 个槽位**全被真孔填满**、一个都不留空，于是报告干脆利落地列 6 个孔，
+    而零件有 12 个——没有留空、没有失败、没有任何提示。孔数改为从档案来（缺省才推断）。
+    整体旋转不影响：相位锚是从数据里选的。
     """
     if not cands:
         return None
+    step = 360.0 / n
     nx, ny = to_norm([(c[0], c[1]) for c in cands], ocx, ocy, oa1, oa2, oang)
     r2 = np.hypot(nx, ny)
     th2 = (np.degrees(np.arctan2(ny, nx)) + 360) % 360
@@ -182,8 +189,8 @@ def hexagon_slots(cands, ocx, ocy, oa1, oa2, oang, tol_ang=13, tol_r=0.15):
         for j in range(len(cands)):
             if i == j:
                 continue
-            dmod = ((th2[j] - th2[i]) % 60 + 60) % 60
-            dd = min(dmod, 60 - dmod)              # 与锚+60k 的最短角距
+            dmod = ((th2[j] - th2[i]) % step + step) % step
+            dd = min(dmod, step - dmod)            # 与锚+n·k 的最短角距
             if dd < tol_ang and abs(r2[j] - r2[i]) / r2[i] < tol_r:
                 hits += 1
         score = hits + cands[i][2] * 0.5               # 同命中数时响应高的优先
@@ -192,8 +199,8 @@ def hexagon_slots(cands, ocx, ocy, oa1, oa2, oang, tol_ang=13, tol_r=0.15):
     p0 = cands[best_i]
     th0, r0 = th2[best_i], r2[best_i]
     slots = []
-    for k in range(6):
-        exp_ang = (th0 + 60 * k) % 360
+    for k in range(n):
+        exp_ang = (th0 + step * k) % 360
         dd = (th2 - exp_ang + 180) % 360 - 180       # 绝对角差(最近360)
         m = (np.abs(dd) < tol_ang) & (np.abs(r2 - r0) / r0 < tol_r) & \
             (np.array([c[2] for c in cands]) >= 0.35)
@@ -625,21 +632,44 @@ def measure_core_hole(sm, x, y, r_exp):
     return (cx, cy), 2.0 * float(np.median(d)), int(len(d))
 
 
-def profile_slots(profile, norm, ocx, ocy, oa1, oa2, oang, phase_step=1.0):
-    """按档案的显式角度定位各孔：先扫整体相位，再给出各孔角度。
+# ======================================================================
+# 螺栓孔：两个正交维度的策略表
+#   locate   —— 怎么找到各孔位置
+#   boundary —— 量哪条边界（决定了"读数"是什么含义）
+# 型号档案里各写一个名字。**所有型号平级**：没有哪个型号被写死在代码默认里，
+# 缺档案时才落到 DEFAULT_* 兜底，且结果一律标"未经验证"。
+# 新增一个零件形态 = 加一个策略函数（约 15 行），不用碰 detect()。
+# ======================================================================
 
-    型号2 的 4 孔是 2x2 矩形布局（实测相邻间隔 72.8/107.4/72.0/107.8°，**不是 90° 等分**），
-    所以不能沿用"等分 N 槽"。档案里存的是**相对角度**，绝对相位由图像数据自己找
-    （扫一圈让模板角度尽量落在暗处），零件转个角度也不怕。
+DEFAULT_LOCATE = "template_ngon"
+DEFAULT_BOUNDARY = "countersink_rim"
+NGON_CANDIDATES = (3, 4, 5, 6, 8, 10, 12)   # 档案没给孔数时推断等分数的候选
+
+
+def ctx_sm2(ctx):
+    """按需算 σ=2 的模糊图（暗芯只有几十 px，用 detect 里 σ=5 那张会糊过头）。"""
+    if ctx.get("sm2") is None:
+        ctx["sm2"] = cv2.GaussianBlur(ctx["gray"], (0, 0), 2)
+    return ctx["sm2"]
+
+
+def locate_by_profile_angles(prof, ctx):
+    """按档案给的**相对角度**定位：先扫整体相位，再给出各孔位置。
+
+    绝对相位由图像数据自己找（扫一圈让模板角度尽量落在暗处），零件转个角度也不怕。
+    支持非等分布局（型号2 是 2x2 矩形：相邻间隔 72.8/107.4/72.0/107.8°，不是 90°）。
+    需要 bolt_mm + mm_per_px 才算得出边界的期望半径；缺了就没法量，如实返回空。
     """
-    rel = profile.get("bolt_angles_rel")
-    if not rel:
-        return None
+    rel, mmpx, bolt_mm = (prof.get("bolt_angles_rel"), prof.get("mm_per_px"),
+                          prof.get("bolt_mm"))
+    if not rel or not mmpx or not bolt_mm:
+        return []
     rel = np.asarray(rel, float)
-    r_norm = float(profile.get("bolt_circle_ratio", 0.8))
-    h, w = norm.shape
+    r_norm = float(prof.get("bolt_circle_ratio", 0.8))
+    (ocx, ocy), (oa1, oa2), oang = ctx["outer"]
+    norm, h, w = ctx["norm"], ctx["h"], ctx["w"]
     best, best_ph = None, 0.0
-    for ph in np.arange(0.0, 360.0, phase_step):
+    for ph in np.arange(0.0, 360.0, 1.0):
         xs, ys = from_norm(np.cos(np.deg2rad(ph + rel)) * r_norm,
                            np.sin(np.deg2rad(ph + rel)) * r_norm, ocx, ocy, oa1, oa2, oang)
         vals = [norm[int(round(y)), int(round(x))] for x, y in zip(xs, ys)
@@ -649,21 +679,131 @@ def profile_slots(profile, norm, ocx, ocy, oa1, oa2, oang, phase_step=1.0):
         score = -float(np.mean(vals))          # 孔是暗的：越暗越像
         if best is None or score > best:
             best, best_ph = score, float(ph)
-    return [(best_ph + a) % 360 for a in rel], r_norm
+    r_exp = (float(bolt_mm) / 2) / float(mmpx)
+    seeds = []
+    for a in rel:
+        ang = (best_ph + a) % 360
+        x, y = from_norm(np.cos(np.deg2rad(ang)) * r_norm,
+                         np.sin(np.deg2rad(ang)) * r_norm, ocx, ocy, oa1, oa2, oang)
+        seeds.append({"x": float(x), "y": float(y), "r_exp": r_exp, "src": "profile"})
+    return seeds
+
+
+def infer_ngon_n(cands, ctx, ns=NGON_CANDIDATES):
+    """档案没给孔数时从候选峰推断等分数：取"真命中最多"的 n。
+
+    评分只看**真命中**、不看槽位总数——推定槽位是白送的（任何 n 都能凑满），
+    拿它评分会一味偏向 n 大的。这正是原来写死 6 会让 12 孔零件静默只报 6 个的反面。
+    """
+    (ocx, ocy), (oa1, oa2), oang = ctx["outer"]
+    best_n, best_key = 6, None
+    for n in ns:
+        slots = ngon_slots(cands, ocx, ocy, oa1, oa2, oang, n=n)
+        if not slots:
+            continue
+        filled = sum(1 for _, _, u in slots if u is not None)
+        key = (filled, -n)              # 真命中优先；同命中取孔数少的（更保守）
+        if best_key is None or key > best_key:
+            best_n, best_key = n, key
+    return best_n
+
+
+def locate_by_template_ngon(prof, ctx):
+    """数据驱动定位：暗斑模板匹配取峰 -> n 等分假设校验 -> 各槽位位置。
+
+    n 优先用档案的 bolt_count。**中心孔没检出也照样跑**（不再整段跳过）——
+    有中心孔就把它从环带里挖掉，没有就用整个盘面；以前那种"中心孔一挂、螺栓孔
+    根本不试、却报'没检测到螺栓孔'"的误导就是从这里来的。
+    """
+    sm, norm = ctx["sm"], ctx["norm"]
+    (ocx, ocy), (oa1, oa2), oang = ctx["outer"]
+    h, w = ctx["h"], ctx["w"]
+    r_outer = (oa1 + oa2) / 4
+    band = np.zeros((h, w), np.uint8)
+    cv2.ellipse(band, (int(ocx), int(ocy)),
+                (int(oa1 / 2 * 0.98), int(oa2 / 2 * 0.98)), oang, 0, 360, 255, -1)
+    hole = ctx["hole"][0]
+    if hole is not None:
+        (hcx, hcy), (ha1, ha2), hang = hole
+        cv2.ellipse(band, (int(hcx), int(hcy)),
+                    (int(ha1 / 2 * 1.05), int(ha2 / 2 * 1.05)), hang, 0, 360, 0, -1)
+    tmpl = rough_templates(sm, band)
+    if tmpl is None:
+        return []
+    cands = []
+    for x, y, v in template_locate(sm, tmpl):
+        dd = np.hypot(x - ocx, y - ocy)
+        if not (r_outer * 0.5 < dd < r_outer * 1.05):
+            continue
+        if len(find_edge_points(sm, x, y, 40, 140, -1, 0.8, n_ray=48)) < 12:
+            continue
+        cands.append((x, y, v))
+    if not cands:
+        return []
+    n = int(prof["bolt_count"]) if prof.get("bolt_count") else infer_ngon_n(cands, ctx)
+    seeds = []
+    for exp_ang, r_norm, use in (ngon_slots(cands, ocx, ocy, oa1, oa2, oang, n=n) or []):
+        if use is not None:
+            x, y, src = use[0], use[1], "detected"
+        else:
+            # 槽位没匹配到峰 -> 位置是**推定**的，必须标出来，不能让它看起来像实测
+            x, y = from_norm(np.cos(np.deg2rad(exp_ang)) * r_norm,
+                             np.sin(np.deg2rad(exp_ang)) * r_norm, ocx, ocy, oa1, oa2, oang)
+            src = "synthesized"
+        seeds.append({"x": float(x), "y": float(y), "r_exp": None, "src": src})
+    return seeds
+
+
+def boundary_countersink_rim(ctx, x, y, r_exp):
+    """沉孔口边界：螺丝头锚定 -> 宽暗游程末端 0.72 阈值交叉 -> 净弧椭圆拟合。
+
+    "暗沉孔 + 亮螺丝头"那类（型号1）的定义；不需要标称尺寸（头半径从图里量）。
+    """
+    ell, n, _ = measure_bolt(ctx["norm"], x, y)
+    if ell is None:
+        return None, n
+    (ex, ey), (a1, a2), ang = ell
+    return (ex, ey), (a1, a2), ang, n
+
+
+def boundary_dark_core(ctx, x, y, r_exp):
+    """暗芯边界：种子挪到暗芯重心 -> 亮度中分界 -> 中位半径当直径。
+
+    "装好紧固件"那类（型号2）的定义。**需要 r_exp**（由 bolt_mm/mm_per_px 算出），
+    搜索带要围绕期望半径；没有标称尺寸就量不了，如实返回失败而不是硬给一个数。
+    """
+    if not r_exp:
+        return None, 0
+    c, dia, n = measure_core_hole(ctx_sm2(ctx), x, y, r_exp)
+    if c is None:
+        return None, n
+    return c, (dia, dia), 0.0, n
+
+
+LOCATE_FNS = {
+    "profile_angles": locate_by_profile_angles,
+    "template_ngon": locate_by_template_ngon,
+}
+
+BOUNDARY_FNS = {
+    "countersink_rim": boundary_countersink_rim,
+    "dark_core": boundary_dark_core,
+}
 
 
 def detect(img, init_c=None, init_r=None, profile=None):
     """完整检测管线(BGR图 -> 测量结果 dict)。
 
-    profile: 型号档案(dict)。None 时行为与无档案版本完全一致（基线路径）。
-             feature="core_hole" 的型号（装好紧固件的暗芯圆孔）会改走
-             profile_slots + measure_core_hole，不再依赖中心孔。
+    profile: 型号档案(dict)。里面的 locate/boundary 决定螺栓孔怎么测；两者缺一
+             或整个档案为 None 时落到 DEFAULT_* 兜底，并把 bolts_unverified 置 True
+             （缺档案 = 没有标称值可校验、也没有专属 mm/px，结果不可当真）。
 
     返回:
         outer: (center,(axis1,axis2),angle[,n]) 或 None
         center_hole: 同上
-        bolts: [{cx,cy,dia,a1,a2,status,n}]
-        缺外圈/中心孔时螺栓孔不测。
+        bolts: [{cx,cy,dia,a1,a2,status,n,src}]，src=detected/profile/synthesized
+        bolts_locate / bolts_boundary: 实际用到的策略名
+        bolts_unverified: 是否走了兜底（缺档案或不完整）
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
@@ -681,7 +821,8 @@ def detect(img, init_c=None, init_r=None, profile=None):
             outer, n_o = ell, n
             break
     if outer is None:
-        return {"outer": None, "center_hole": None, "bolts": [], "bolts_skipped": True}
+        return {"outer": None, "center_hole": None, "bolts": [],
+                "bolts_locate": None, "bolts_boundary": None, "bolts_unverified": True}
     (ocx, ocy), (oa1, oa2), oang = outer
 
     # ---- 中心孔: 外圈内暗->亮的上升沿 ----
@@ -701,76 +842,35 @@ def detect(img, init_c=None, init_r=None, profile=None):
     else:
         (hcx, hcy), (ha1, ha2), hang = hole
 
-    # ---- 螺栓孔 ----
-    bolts = []
-    bolts_skipped = False       # 区分"整段没被尝试"与"试了没找到"
+    # ---- 螺栓孔: locate(怎么定位孔) + boundary(量哪条边界) 两个维度派发 ----
     prof = profile or {}
-    mmpx = prof.get("mm_per_px")
-    if (prof.get("feature") == "core_hole" and prof.get("bolt_angles_rel")
-            and prof.get("bolt_mm") and mmpx):
-        # 装好紧固件的"暗芯圆孔"型号（型号2）：按档案角度定位，量暗芯。
-        # 这条路不需要中心孔，所以不走下面那个 `if hole is not None` 的门。
-        norm = sm / np.maximum(cv2.blur(sm, (201, 201)), 1)
-        slots = profile_slots(prof, norm, ocx, ocy, oa1, oa2, oang)
-        sm2 = cv2.GaussianBlur(gray, (0, 0), 2)      # 暗芯只有几十 px，σ=5 会糊过头
-        r_exp = (float(prof["bolt_mm"]) / 2) / float(mmpx)
-        if slots:
-            angs_abs, r_norm = slots
-            for ang_abs in angs_abs:
-                x, y = from_norm(np.cos(np.deg2rad(ang_abs)) * r_norm,
-                                 np.sin(np.deg2rad(ang_abs)) * r_norm,
-                                 ocx, ocy, oa1, oa2, oang)
-                ell, dia, n = measure_core_hole(sm2, x, y, r_exp)
-                if ell is None:
-                    bolts.append({"cx": x, "cy": y, "dia": 0.0, "a1": 0.0, "a2": 0.0,
-                                  "n": n, "status": "失败"})
-                    continue
-                (ex, ey) = ell
-                bolts.append({"cx": ex, "cy": ey, "dia": dia, "a1": dia, "a2": dia,
-                              "ang": 0.0, "n": n, "status": "OK"})
-    elif hole is not None:
-        band = np.zeros((h, w), np.uint8)
-        cv2.ellipse(band, (int(ocx), int(ocy)),
-                    (int(oa1 / 2 * 0.98), int(oa2 / 2 * 0.98)), oang, 0, 360, 255, -1)
-        cv2.ellipse(band, (int(hcx), int(hcy)),
-                    (int(ha1 / 2 * 1.05), int(ha2 / 2 * 1.05)), hang, 0, 360, 0, -1)
-        norm = sm / np.maximum(cv2.blur(sm, (201, 201)), 1)
-        tmpl = rough_templates(sm, band)
-        if tmpl is not None:
-            peaks = template_locate(sm, tmpl)
-            cands = []
-            for x, y, v in peaks:
-                dd = np.hypot(x - ocx, y - ocy)
-                if not (r_outer * 0.5 < dd < r_outer * 1.05):
-                    continue
-                if len(find_edge_points(sm, x, y, 40, 140, -1, 0.8, n_ray=48)) < 12:
-                    continue
-                cands.append((x, y, v))
-            slots = hexagon_slots(cands, ocx, ocy, oa1, oa2, oang)
-            if slots:
-                for exp_ang, r_norm, use in slots:
-                    if use is not None:
-                        x, y = use[0], use[1]
-                    else:
-                        x, y = from_norm(np.cos(np.deg2rad(exp_ang)) * r_norm,
-                                         np.sin(np.deg2rad(exp_ang)) * r_norm,
-                                         ocx, ocy, oa1, oa2, oang)
-                    ell, n, (hx, hy) = measure_bolt(norm, x, y)
-                    if ell is None:
-                        bolts.append({"cx": x, "cy": y, "dia": 0.0, "a1": 0.0, "a2": 0.0,
-                                      "n": 0, "status": "失败"})
-                        continue
-                    (ex, ey), (ea1, ea2), eang = ell
-                    bolts.append({"cx": ex, "cy": ey, "dia": (ea1 + ea2) / 2,
-                                  "a1": ea1, "a2": ea2, "ang": eang, "n": n,
-                                  "status": "OK"})
-    else:
-        # 中心孔没检出 → 这段螺栓孔定位（模板/共圆校验都以外圈椭圆为参照、但暗斑环带
-        # 要拿中心孔挖出来）整段**没有被尝试**。以前一律报「未检测到螺栓孔」，
-        # 操作员会去查孔，其实该查中心孔——所以这里把"没尝试"和"试了没找到"分开。
-        bolts_skipped = True
+    norm = sm / np.maximum(cv2.blur(sm, (201, 201)), 1)
+    ctx = {"sm": sm, "sm2": None, "gray": gray, "norm": norm,
+           "outer": outer, "hole": (hole, n_h), "w": w, "h": h}
+    locate_name = prof.get("locate")
+    boundary_name = prof.get("boundary")
+    # 档案缺一维（或整个没给）就落到兜底：**结果一律标"未经验证"**——
+    # 没有标称值可校验、也没有本型号专属的 mm/px，不能当真。
+    unverified = locate_name not in LOCATE_FNS or boundary_name not in BOUNDARY_FNS
+    if locate_name not in LOCATE_FNS:
+        locate_name = DEFAULT_LOCATE
+    if boundary_name not in BOUNDARY_FNS:
+        boundary_name = DEFAULT_BOUNDARY
+    bfn = BOUNDARY_FNS[boundary_name]
+    bolts = []
+    for s in LOCATE_FNS[locate_name](prof, ctx):
+        got = bfn(ctx, s["x"], s["y"], s["r_exp"])
+        if got is None or got[0] is None:
+            bolts.append({"cx": s["x"], "cy": s["y"], "dia": 0.0, "a1": 0.0, "a2": 0.0,
+                          "n": got[1] if got else 0, "src": s["src"], "status": "失败"})
+            continue
+        (ex, ey), (ea1, ea2), eang, n = got
+        bolts.append({"cx": ex, "cy": ey, "dia": (ea1 + ea2) / 2,
+                      "a1": ea1, "a2": ea2, "ang": eang, "n": n,
+                      "src": s["src"], "status": "OK"})
     return {"outer": (outer, n_o), "center_hole": (hole, n_h), "bolts": bolts,
-            "bolts_skipped": bolts_skipped}
+            "bolts_locate": locate_name, "bolts_boundary": boundary_name,
+            "bolts_unverified": unverified}
 
 
 def main(p: Path):

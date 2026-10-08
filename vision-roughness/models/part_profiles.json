@@ -1,23 +1,31 @@
 {
   "_说明": [
-    "零件型号档案。每个型号一组标称值与检测参数；不传 --profile 时行为与以前完全一致（走老路）。",
-    "od_mm 既是 OK/NG 的标称外径，也是本型号 mm/px 的标定依据（换型号必须重新用卡尺量外径）。",
-    "mm_per_px 单独存：不同型号往往要换机位，尺度跟着机位走，不能跨型号复用。",
-    "feature: countersink=型号1那类暗沉孔口（沿用原有模板匹配+螺丝头锚定那条路）；",
-    "         core_hole=型号2那类装好紧固件的暗芯圆孔（按 bolt_angles_rel 定位、量暗芯）。",
-    "bolt_angles_rel: 各孔相对第 1 个孔的角度偏移（度）。型号2 是 2x2 矩形布局，不是 90 等分。"
+    "零件型号档案。所有型号平级：检测由 locate(怎么定位孔) + boundary(量哪条边界) 两个维度决定，",
+    "不再有“某个型号是代码里的默认样式”这回事。不传 --profile 时用 _默认型号（车间入口走这条）。",
+    "od_mm     外径卡尺真值，同时是本型号 mm_per_px 的标定依据。",
+    "bolt_mm   特征的标称值（boundary 决定它指的是哪条边界）。null=还没量，不判 OK/NG。",
+    "bolt_count 孔数；template_ngon 定位拿它当等分数，缺省则由数据推断。",
+    "bolt_angles_rel 各孔相对第 1 个孔的角度偏移；给了就用 profile_angles 定位（支持非等分）。",
+    "locate    profile_angles(按角度+相位搜索) | template_ngon(暗斑模板匹配 + n 等分校验)",
+    "boundary  countersink_rim(沉孔口阈值交叉) | dark_core(暗芯中分界)",
+    "mm_per_px 本型号的换算系数，每个型号各一份——尺度跟机位走，不能跨型号复用。"
   ],
+  "_默认型号": "型号1-6孔圆环",
   "型号1-6孔圆环": {
     "od_mm": 88.6,
     "id_mm": null,
     "has_center_hole": true,
     "bolt_mm": null,
     "bolt_count": 6,
-    "feature": "countersink",
+    "locate": "template_ngon",
+    "boundary": "countersink_rim",
     "bolt_angles_rel": null,
     "bolt_circle_ratio": 0.78,
     "mm_per_px": 0.03265837402143378,
-    "_备注": "od_mm 是当初 --ref-mm 用过的卡尺真值；孔径/螺栓孔标称值用户还没给，留 null（不给就不判 OK/NG）"
+    "_备注": [
+      "od_mm 是当初 --ref-mm 用过的卡尺真值；中心孔/螺栓孔标称值用户还没给，留 null。",
+      "螺栓孔测的是沉孔口口径（含沉孔锥度），不是螺纹孔径；读数分散 ±7%，不得据此判超差。"
+    ]
   },
   "型号2-4孔圆盘": {
     "od_mm": 126.0,
@@ -25,7 +33,8 @@
     "has_center_hole": false,
     "bolt_mm": 1.78,
     "bolt_count": 4,
-    "feature": "core_hole",
+    "locate": "profile_angles",
+    "boundary": "dark_core",
     "bolt_angles_rel": [
       0.0,
       72.8,
@@ -35,10 +44,11 @@
     "bolt_circle_ratio": 0.818,
     "mm_per_px": 0.04836640294230451,
     "_备注": [
-      "无中心孔（实心盘），所以 id_mm=null 且检测不走中心孔那一段。",
-      "bolt_mm=1.78 指紧固件中间那个暗芯通孔；实测暗芯 36.4px≈1.759mm，差 1.1%。",
-      "bolt_angles_rel 由实测角度 65.8/138.6/246.0/318.0 换算（矩形布局，非 90 等分）。",
-      "mm_per_px = 126.0 / 2605.1px（2026-10-07 实拍盘径）。"
+      "无中心孔（实心盘）：has_center_hole=false，检测不走中心孔那一段。",
+      "这 4 个“孔”是装好的紧固件（暗芯 + 亮环 + 两片亮叶片），bolt_mm=1.78 指中间暗芯通孔；",
+      "实测暗芯 36.4px≈1.759mm，差 1.1%，但单孔离散 ±15%，不得据此判超差。",
+      "bolt_angles_rel 由实测角度 65.8/138.6/246.0/318.0 换算（2x2 矩形布局，非 90 等分）。",
+      "mm_per_px = 126.0 / 2605.114136px（2026-10-07 实拍外圈均值直径）。"
     ]
   }
 }
