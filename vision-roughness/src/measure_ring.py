@@ -101,8 +101,9 @@ def save_profile_mm_per_px(prof, ratio):
 
 # ---------------- 型号指纹的存取（自动识别用的参考数据） ----------------
 
-FP_META_NOTE = ("参考图不入库（data/captures/ 已被 .gitignore 忽略），指纹是唯一凭据："
-                "换参考图/换机位/换光照/换镜头都必须重新生成，否则识别会失准")
+FP_META_NOTE = ("参考图默认不入库（data/captures/ 被 .gitignore 忽略，例外只有 AGENTS.md §3 "
+                "那几张回归夹具图），指纹是自动识别的凭据：换参考图/换机位/换光照/换镜头"
+                "都必须重新生成，否则识别会失准")
 
 
 def fingerprint_path(name: str) -> Path:
