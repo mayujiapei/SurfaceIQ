@@ -310,6 +310,15 @@ SurfaceIQ/
    ```
 
 3. 换算系数跟着「相机 + 镜头 + 拍摄距离」走，**三者任一变化都必须对该型号重新标定**。
+4. **每个型号的识别指纹也要重新生成**（指纹描述的是"这张参考图长什么样"，机位/光照/镜头
+   一变它就失准，会把型号认错或认不出）：
+
+   ```bash
+   venv\Scripts\python.exe src\measure_ring.py --profile <型号名> --image <该型号的实拍图> --save-fingerprint
+   ```
+
+   生成的 `models/fingerprints/<型号名>.npz` **要提交进仓库**——参考图在 `data/captures/`
+   不入库，指纹是自动识别的唯一凭据。旁边那张 `<型号名>.png` 是给人核对的预览。
 
 ---
 
