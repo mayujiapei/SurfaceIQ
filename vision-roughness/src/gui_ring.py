@@ -44,16 +44,21 @@ _bootstrap_path()
 
 import cv2  # noqa: E402  (必须在 sys.path 处理之后)
 import tkinter as tk  # noqa: E402
-from tkinter import messagebox  # noqa: E402
+from tkinter import messagebox, ttk  # noqa: E402
 
 import config  # noqa: E402
 from camera_adapter import create_camera  # noqa: E402
-from measure_ring import MeasureError, build_parser, measure  # noqa: E402
+from measure_ring import (IDENT_AUTO, IDENT_EXPLICIT, IDENT_NOPROFILE, IDENT_UNIDENTIFIED,
+                          MeasureError, build_parser, load_profiles, measure)  # noqa: E402
 
 LOG_PATH = PROJECT_ROOT / "debug" / "gui_error.log"
 RUN_LOG = PROJECT_ROOT / "debug" / "gui_run.log"
 
 CIRCLED = "①②③④⑤⑥"
+PICK_AUTO = "自动识别（按指纹）"        # 型号下拉框的两个固定项
+PICK_NOPROFILE = "无档案试测（只给像素）"
+IDENT_LABEL = {IDENT_AUTO: "自动识别", IDENT_EXPLICIT: "人工指定",
+               IDENT_NOPROFILE: "无档案试测", IDENT_UNIDENTIFIED: "未识别"}
 COLOR_BG = "#ffffff"
 COLOR_TEXT = "#111827"
 COLOR_MUTED = "#6b7280"
@@ -116,6 +121,20 @@ def pick_font(root) -> str:
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def model_choices() -> list:
+    """型号下拉框的选项：「自动识别」+ 档案里的型号 +「无档案试测」。
+
+    读不到档案（文件缺失/损坏）也不能让窗口起不来：退回只剩两个固定项并记日志——
+    窗口是车间唯一的入口，宁可少几个选项也不能打不开。
+    """
+    names = []
+    try:
+        names = [k for k in load_profiles() if not k.startswith("_")]
+    except Exception as e:                  # noqa: BLE001
+        write_log(f"[{_now()}] 读型号档案失败，型号下拉框只保留固定项: {e}")
+    return [PICK_AUTO] + names + [PICK_NOPROFILE]
 
 
 def _open_file(path):
@@ -388,6 +407,15 @@ class MeasureWindow:
         self.btn_rep.pack(side="left", padx=8)
         self._button(btns, "关闭 (Esc)", self.root.destroy).pack(side="right")
 
+        # 型号选择：默认自动识别（不传 --profile）。识别失败时在这里选，选完自动重测一次。
+        # 这是"人工选择"这条兜底路，不是数值计算——本文件照旧不碰任何读数（AGENTS.md §6）。
+        self.cmb_profile = None
+        try:
+            self._build_profile_picker(root)
+        except tk.TclError as e:
+            # 下拉框起不来不该拖垮整个窗口（车间入口）。少一个控件，测量照旧。
+            write_log(f"[{_now()}] 型号下拉框创建失败（不影响测量）: {e}")
+
         # 显示增强：只改画面亮度，不改测量用的像素值。
         # takefocus=0 —— 否则点过复选框后焦点留在它身上，空格会去切换复选框
         # 而不是触发"测量"。
@@ -415,6 +443,39 @@ class MeasureWindow:
         y = max(0, (root.winfo_screenheight() - h) // 4)
         root.geometry(f"+{x}+{y}")
         root.minsize(w, h)
+
+    def _build_profile_picker(self, root):
+        """型号下拉框（「自动识别」/ 各型号 /「无档案试测」）。"""
+        pick = tk.Frame(root, bg=COLOR_BG)
+        pick.pack(fill="x", padx=18, pady=(2, 0))
+        tk.Label(pick, text="型号:", font=(self.ui, 11), bg=COLOR_BG,
+                 fg=COLOR_TEXT).pack(side="left")
+        # takefocus=0：点过下拉框后焦点别留在它身上，否则空格会去开下拉菜单而不是测量
+        self.cmb_profile = ttk.Combobox(pick, state="readonly", width=22, takefocus=0,
+                                        values=model_choices(), font=(self.ui, 11))
+        self.cmb_profile.set(PICK_AUTO)
+        self.cmb_profile.pack(side="left", padx=(6, 8))
+        self.cmb_profile.bind("<<ComboboxSelected>>", self._on_profile_pick)
+        tk.Label(pick, text="（自动识别失败时，在这里选零件型号）", font=(self.ui, 9),
+                 bg=COLOR_BG, fg=COLOR_MUTED).pack(side="left")
+
+    def _on_profile_pick(self, _event=None):
+        """把下拉框的选择写进 self.args —— 与命令行的 --profile 完全同一套参数。
+
+        界面只决定"用哪个型号"，读数仍全部由 measure_ring.measure() 产出。
+        选完自动重测一次，省得操作员再按一次键。
+        """
+        if self.cmb_profile is None:
+            return
+        picked = self.cmb_profile.get()
+        if picked == PICK_AUTO:
+            self.args.profile = None                 # 不传 = 自动识别
+        elif picked == PICK_NOPROFILE:
+            self.args.profile = "none"               # 与 --profile none 同一语义
+        else:
+            self.args.profile = picked
+        write_log(f"[{_now()}] 型号选择: {picked} -> profile={self.args.profile!r}")
+        self.do_measure()
 
     def _number_row(self, parent, title, size, pady=(0, 10)):
         """一行大数字：小标题 + 特大数字 + 单位。返回数字 Label 供更新。"""
@@ -578,8 +639,21 @@ class MeasureWindow:
                 lbl.config(text=f"{CIRCLED[i]}{b['mm']:.3f}{mark}",
                            fg=COLOR_NG if b.get("ok") is False else COLOR_TEXT)
 
-        if r.warnings:
-            self._show_message("；\n".join("⚠ " + w for w in r.warnings), "warn")
+        msgs = []
+        hidden = len(r.bolts) - len(self.bolt_labels)
+        if hidden > 0:
+            # 孔位只有 6 个（CIRCLED），多出来的**必须说出来**，不能静默丢掉——
+            # 当年"写死 6 孔、12 孔零件静默只报 6 个"就是这一类坑。
+            msgs.append(f"⚠ 本件检测到 {len(r.bolts)} 个孔，界面只显示前 {len(self.bolt_labels)} 个")
+        if r.ident_source == IDENT_UNIDENTIFIED:
+            # 认不出型号就不猜（没有读数总比拿错型号的读数安全）：提示操作员手动指定
+            hint = ("⚠ 没能自动识别零件型号：请在上面「型号」里选一个（或选「无档案试测」）"
+                    if self.cmb_profile is not None else
+                    "⚠ 没能自动识别零件型号：请用命令行 --profile <型号名> 指定后重测")
+            msgs.append(hint)
+        msgs += ["⚠ " + w for w in r.warnings]
+        if msgs:
+            self._show_message("；\n".join(msgs), "warn")
         else:
             self._show_message(None)
 
@@ -591,6 +665,7 @@ class MeasureWindow:
         self._sync_pause_button()
         self._measuring = False
         prof = (f"型号: {r.profile_name}" if r.profile_name else "型号: 未指定（无档案）")
+        prof += f"（{IDENT_LABEL.get(r.ident_source, r.ident_source)}）"
         if r.unverified:
             prof += "·未验证"
         coef = (f"换算系数: {r.ratio:.6f} mm/px（{r.ratio_src}）" if r.ratio is not None
